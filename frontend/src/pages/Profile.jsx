@@ -1,10 +1,11 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { getProfile, updateProfile } from '../api/authApi';
 import { useAuth } from '../context/AuthContext';
-import { User, DollarSign, Lock, Shield, Eye, EyeOff, CheckCircle2, AlertCircle } from 'lucide-react';
+import { User, DollarSign, Lock, Shield, Eye, EyeOff, CheckCircle2, AlertCircle, Upload, Image as ImageIcon } from 'lucide-react';
 
 export default function Profile() {
   const { user, updateUserState } = useAuth();
+  const fileInputRef = useRef(null);
 
   const [formData, setFormData] = useState({
     name: '',
@@ -21,7 +22,7 @@ export default function Profile() {
   const [saving, setSaving] = useState(false);
   const [notification, setNotification] = useState({ type: '', message: '' });
 
-  // Sample avatars user can pick from
+  // Default avatars user can pick from
   const sampleAvatars = [
     'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=150',
     'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=150',
@@ -67,6 +68,28 @@ export default function Profile() {
 
   const handleAvatarSelect = (url) => {
     setFormData((prev) => ({ ...prev, avatar: url }));
+  };
+
+  // Direct file upload from computer
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      if (!file.type.startsWith('image/')) {
+        setNotification({ type: 'error', message: 'Please select a valid image file (PNG, JPG, etc.)' });
+        return;
+      }
+      if (file.size > 2 * 1024 * 1024) {
+        setNotification({ type: 'error', message: 'Image size should be less than 2MB' });
+        return;
+      }
+
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setFormData((prev) => ({ ...prev, avatar: reader.result }));
+        setNotification({ type: 'success', message: 'Photo loaded! Click "Save Profile Changes" to keep it.' });
+      };
+      reader.readAsDataURL(file);
+    }
   };
 
   const handleSubmit = async (e) => {
@@ -157,16 +180,33 @@ export default function Profile() {
               <img
                 src={formData.avatar}
                 alt="Profile Avatar"
-                className="w-24 h-24 rounded-full object-cover ring-4 ring-emerald-100 border border-gray-200"
+                onError={(e) => {
+                  e.target.src = 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=150';
+                }}
+                className="w-24 h-24 rounded-full object-cover ring-4 ring-emerald-100 border border-gray-200 shadow-inner"
               />
-              <span className="text-xs text-gray-400">Current Avatar</span>
+              <button
+                type="button"
+                onClick={() => fileInputRef.current.click()}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded-lg border border-emerald-200 transition-colors"
+              >
+                <Upload className="w-3.5 h-3.5" />
+                Upload Photo
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                onChange={handleFileUpload}
+                className="hidden"
+              />
             </div>
 
             {/* Avatar Selection & Form Fields */}
             <div className="flex-1 w-full space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Choose Avatar or Enter Image URL
+                  Choose Preset Avatar or Upload Your Own
                 </label>
                 <div className="flex items-center gap-3 mb-3">
                   {sampleAvatars.map((url, idx) => (
@@ -182,14 +222,17 @@ export default function Profile() {
                     </button>
                   ))}
                 </div>
-                <input
-                  type="url"
-                  name="avatar"
-                  value={formData.avatar}
-                  onChange={handleChange}
-                  placeholder="https://example.com/avatar.jpg"
-                  className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                />
+
+                <div className="relative">
+                  <input
+                    type="url"
+                    name="avatar"
+                    value={formData.avatar.startsWith('data:') ? '' : formData.avatar}
+                    onChange={handleChange}
+                    placeholder={formData.avatar.startsWith('data:') ? 'Custom uploaded image active' : 'Or paste direct image URL (must end in .jpg, .png)'}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  />
+                </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
