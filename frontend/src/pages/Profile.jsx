@@ -1,10 +1,29 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { getProfile, updateProfile } from '../api/authApi';
 import { useAuth } from '../context/AuthContext';
-import { User, DollarSign, Lock, Shield, Eye, EyeOff, CheckCircle2, AlertCircle, Upload, Image as ImageIcon } from 'lucide-react';
+import { useTheme } from '../context/ThemeContext';
+import {
+  User,
+  Shield,
+  Eye,
+  EyeOff,
+  CheckCircle2,
+  AlertCircle,
+  Upload,
+  Sparkles,
+  Lock,
+  Coins,
+  Sun,
+  Moon,
+  Laptop,
+  Mail,
+  KeyRound,
+  Fingerprint,
+} from 'lucide-react';
 
 export default function Profile() {
   const { user, updateUserState } = useAuth();
+  const { theme, toggleTheme } = useTheme();
   const fileInputRef = useRef(null);
 
   const [formData, setFormData] = useState({
@@ -22,7 +41,6 @@ export default function Profile() {
   const [saving, setSaving] = useState(false);
   const [notification, setNotification] = useState({ type: '', message: '' });
 
-  // Default avatars user can pick from
   const sampleAvatars = [
     'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=150',
     'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&q=80&w=150',
@@ -51,7 +69,7 @@ export default function Profile() {
     } catch (err) {
       setNotification({
         type: 'error',
-        message: err.response?.data?.message || 'Failed to load profile. Please make sure you are logged in.',
+        message: err.response?.data?.message || 'Failed to load profile.',
       });
     } finally {
       setLoading(false);
@@ -70,12 +88,11 @@ export default function Profile() {
     setFormData((prev) => ({ ...prev, avatar: url }));
   };
 
-  // Direct file upload from computer
   const handleFileUpload = (e) => {
     const file = e.target.files[0];
     if (file) {
       if (!file.type.startsWith('image/')) {
-        setNotification({ type: 'error', message: 'Please select a valid image file (PNG, JPG, etc.)' });
+        setNotification({ type: 'error', message: 'Please select a valid image file' });
         return;
       }
       if (file.size > 2 * 1024 * 1024) {
@@ -86,7 +103,7 @@ export default function Profile() {
       const reader = new FileReader();
       reader.onloadend = () => {
         setFormData((prev) => ({ ...prev, avatar: reader.result }));
-        setNotification({ type: 'success', message: 'Photo loaded! Click "Save Profile Changes" to keep it.' });
+        setNotification({ type: 'success', message: 'Photo preview loaded!' });
       };
       reader.readAsDataURL(file);
     }
@@ -134,151 +151,195 @@ export default function Profile() {
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-[60vh]">
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-emerald-600"></div>
+        <div className="relative">
+          <div className="w-12 h-12 rounded-full border-2 border-emerald-500/20 border-t-emerald-500 animate-spin"></div>
+          <Sparkles className="w-4 h-4 text-emerald-500 absolute inset-0 m-auto" />
+        </div>
       </div>
     );
   }
 
   return (
-    <div className="max-w-4xl mx-auto p-4 sm:p-6 lg:p-8">
-      {/* Header */}
-      <div className="mb-8">
-        <h1 className="text-3xl font-bold text-gray-900">Profile & Preferences</h1>
-        <p className="text-gray-500 mt-1">
-          Manage your personal details, preferred currency (BDT / USD), avatar, and privacy settings.
-        </p>
+    <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+      {/* Aesthetic Hero Banner */}
+      <div className="relative overflow-hidden rounded-3xl bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 p-8 sm:p-10 text-white shadow-2xl border border-white/5">
+        <div className="absolute top-0 right-0 -mr-16 -mt-16 w-80 h-80 bg-emerald-500/10 rounded-full blur-3xl pointer-events-none"></div>
+        <div className="absolute bottom-0 left-1/3 -mb-20 w-80 h-80 bg-cyan-500/10 rounded-full blur-3xl pointer-events-none"></div>
+
+        <div className="relative z-10 flex flex-col sm:flex-row items-center sm:items-start gap-6 text-center sm:text-left">
+          <div className="relative group">
+            <img
+              src={formData.avatar}
+              alt="Avatar"
+              className="w-24 h-24 sm:w-28 sm:h-28 rounded-full object-cover ring-4 ring-emerald-500/30 border-2 border-white/20 shadow-xl"
+            />
+            <button
+              type="button"
+              onClick={() => fileInputRef.current.click()}
+              className="absolute bottom-0 right-0 p-2 rounded-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-md transition-all hover:scale-110"
+              title="Upload New Photo"
+            >
+              <Upload className="w-4 h-4 stroke-[2.5]" />
+            </button>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleFileUpload}
+              className="hidden"
+            />
+          </div>
+
+          <div className="space-y-1.5 flex-1">
+            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-300 text-xs font-semibold">
+              <Sparkles className="w-3.5 h-3.5" />
+              Verified FinancePulse Member
+            </div>
+            <h1 className="text-3xl font-extrabold tracking-tight text-white">{formData.name || 'User Profile'}</h1>
+            <p className="text-slate-300 text-sm flex items-center justify-center sm:justify-start gap-1.5">
+              <Mail className="w-4 h-4 text-slate-400" />
+              {formData.email}
+            </p>
+          </div>
+        </div>
       </div>
 
       {notification.message && (
         <div
-          className={`p-4 mb-6 rounded-lg flex items-center gap-3 ${
+          className={`p-4 rounded-2xl flex items-center gap-3 text-sm font-medium border shadow-sm transition-all ${
             notification.type === 'success'
-              ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-              : 'bg-rose-50 text-rose-800 border border-rose-200'
+              ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800/60'
+              : 'bg-rose-50 dark:bg-rose-950/40 text-rose-800 dark:text-rose-300 border-rose-200 dark:border-rose-800/60'
           }`}
         >
           {notification.type === 'success' ? (
-            <CheckCircle2 className="w-5 h-5 flex-shrink-0" />
+            <CheckCircle2 className="w-5 h-5 flex-shrink-0 text-emerald-600 dark:text-emerald-400" />
           ) : (
-            <AlertCircle className="w-5 h-5 flex-shrink-0" />
+            <AlertCircle className="w-5 h-5 flex-shrink-0 text-rose-600 dark:text-rose-400" />
           )}
           <span>{notification.message}</span>
         </div>
       )}
 
-      <form onSubmit={handleSubmit} className="space-y-8">
-        {/* Section 1: Avatar & Personal Information */}
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-          <div className="flex items-center gap-2 mb-6 pb-3 border-b border-gray-100">
-            <User className="w-5 h-5 text-emerald-600" />
-            <h2 className="text-xl font-semibold text-gray-800">Personal Information</h2>
+      <form onSubmit={handleSubmit} className="space-y-6">
+        {/* Appearance & Theme Setting */}
+        <div className="bg-white dark:bg-[#121826] p-6 sm:p-8 rounded-3xl border border-slate-200/70 dark:border-slate-800/80 shadow-sm space-y-4 transition-colors">
+          <div className="flex items-center justify-between pb-4 border-b border-slate-100 dark:border-slate-800">
+            <div>
+              <h2 className="text-base font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                <Sun className="w-5 h-5 text-amber-500" />
+                Appearance & Theme
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                Switch between clean modern light theme and futuristic dark mode
+              </p>
+            </div>
           </div>
 
-          <div className="flex flex-col sm:flex-row gap-6 items-start">
-            {/* Current Avatar Preview */}
-            <div className="flex flex-col items-center gap-3">
-              <img
-                src={formData.avatar}
-                alt="Profile Avatar"
-                onError={(e) => {
-                  e.target.src = 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&q=80&w=150';
-                }}
-                className="w-24 h-24 rounded-full object-cover ring-4 ring-emerald-100 border border-gray-200 shadow-inner"
-              />
-              <button
-                type="button"
-                onClick={() => fileInputRef.current.click()}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-700 bg-emerald-50 hover:bg-emerald-100 rounded-lg border border-emerald-200 transition-colors"
-              >
-                <Upload className="w-3.5 h-3.5" />
-                Upload Photo
-              </button>
+          <div className="grid grid-cols-2 gap-4">
+            <button
+              type="button"
+              onClick={() => theme === 'dark' && toggleTheme()}
+              className={`p-4 rounded-2xl border-2 flex items-center gap-3 transition-all ${
+                theme === 'light'
+                  ? 'border-emerald-500 bg-emerald-50/50 dark:bg-emerald-950/20 text-emerald-700'
+                  : 'border-slate-200 dark:border-slate-800 hover:border-slate-300 text-slate-600 dark:text-slate-400'
+              }`}
+            >
+              <Sun className="w-5 h-5 text-amber-500" />
+              <div className="text-left">
+                <div className="font-bold text-sm">Light Mode</div>
+                <div className="text-[11px] opacity-75">Clean & Crisp</div>
+              </div>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => theme === 'light' && toggleTheme()}
+              className={`p-4 rounded-2xl border-2 flex items-center gap-3 transition-all ${
+                theme === 'dark'
+                  ? 'border-emerald-500 bg-emerald-500/10 text-emerald-400'
+                  : 'border-slate-200 dark:border-slate-800 hover:border-slate-300 text-slate-600 dark:text-slate-400'
+              }`}
+            >
+              <Moon className="w-5 h-5 text-indigo-400" />
+              <div className="text-left">
+                <div className="font-bold text-sm">Dark Mode</div>
+                <div className="text-[11px] opacity-75">Sleek Cyber Obsidian</div>
+              </div>
+            </button>
+          </div>
+        </div>
+
+        {/* Personal Details */}
+        <div className="bg-white dark:bg-[#121826] p-6 sm:p-8 rounded-3xl border border-slate-200/70 dark:border-slate-800/80 shadow-sm space-y-6 transition-colors">
+          <div className="flex items-center gap-2.5 pb-4 border-b border-slate-100 dark:border-slate-800">
+            <User className="w-5 h-5 text-emerald-500" />
+            <h2 className="text-base font-bold text-slate-900 dark:text-white">Profile Identity</h2>
+          </div>
+
+          <div>
+            <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2.5">
+              Select Preset Avatar
+            </label>
+            <div className="flex items-center gap-3 mb-4">
+              {sampleAvatars.map((url, idx) => (
+                <button
+                  key={idx}
+                  type="button"
+                  onClick={() => handleAvatarSelect(url)}
+                  className={`relative rounded-full transition-transform hover:scale-110 ${
+                    formData.avatar === url ? 'ring-2 ring-emerald-500 ring-offset-2 dark:ring-offset-[#121826]' : 'opacity-60'
+                  }`}
+                >
+                  <img src={url} alt={`Option ${idx}`} className="w-11 h-11 rounded-full object-cover" />
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
+            <div>
+              <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5">
+                Full Name
+              </label>
               <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                onChange={handleFileUpload}
-                className="hidden"
+                type="text"
+                name="name"
+                required
+                value={formData.name}
+                onChange={handleChange}
+                className="w-full px-4 py-2.5 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700/80 rounded-xl text-sm font-medium focus:outline-none focus:ring-2 focus:ring-emerald-500 text-slate-900 dark:text-slate-100"
               />
             </div>
 
-            {/* Avatar Selection & Form Fields */}
-            <div className="flex-1 w-full space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">
-                  Choose Preset Avatar or Upload Your Own
-                </label>
-                <div className="flex items-center gap-3 mb-3">
-                  {sampleAvatars.map((url, idx) => (
-                    <button
-                      key={idx}
-                      type="button"
-                      onClick={() => handleAvatarSelect(url)}
-                      className={`relative rounded-full transition-transform hover:scale-105 ${
-                        formData.avatar === url ? 'ring-2 ring-emerald-600 ring-offset-2' : 'opacity-70'
-                      }`}
-                    >
-                      <img src={url} alt={`Option ${idx}`} className="w-10 h-10 rounded-full object-cover" />
-                    </button>
-                  ))}
-                </div>
-
-                <div className="relative">
-                  <input
-                    type="url"
-                    name="avatar"
-                    value={formData.avatar.startsWith('data:') ? '' : formData.avatar}
-                    onChange={handleChange}
-                    placeholder={formData.avatar.startsWith('data:') ? 'Custom uploaded image active' : 'Or paste direct image URL (must end in .jpg, .png)'}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Full Name</label>
-                  <input
-                    type="text"
-                    name="name"
-                    required
-                    value={formData.name}
-                    onChange={handleChange}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Email Address</label>
-                  <input
-                    type="email"
-                    value={formData.email}
-                    disabled
-                    className="w-full px-3 py-2 border border-gray-200 bg-gray-50 text-gray-500 rounded-lg text-sm cursor-not-allowed"
-                  />
-                  <p className="text-xs text-gray-400 mt-1">Email cannot be changed.</p>
-                </div>
-              </div>
+            <div>
+              <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5">
+                Account Email
+              </label>
+              <input
+                type="email"
+                value={formData.email}
+                disabled
+                className="w-full px-4 py-2.5 bg-slate-100/70 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 text-slate-400 rounded-xl text-sm font-medium cursor-not-allowed"
+              />
             </div>
           </div>
         </div>
 
-        {/* Section 2: Preferred Currency */}
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-          <div className="flex items-center gap-2 mb-4 pb-3 border-b border-gray-100">
-            <DollarSign className="w-5 h-5 text-emerald-600" />
-            <h2 className="text-xl font-semibold text-gray-800">Currency Preference</h2>
+        {/* Currency Preference */}
+        <div className="bg-white dark:bg-[#121826] p-6 sm:p-8 rounded-3xl border border-slate-200/70 dark:border-slate-800/80 shadow-sm space-y-4 transition-colors">
+          <div className="flex items-center gap-2.5 pb-4 border-b border-slate-100 dark:border-slate-800">
+            <Coins className="w-5 h-5 text-emerald-500" />
+            <h2 className="text-base font-bold text-slate-900 dark:text-white">Primary Ledger Currency</h2>
           </div>
-          <p className="text-sm text-gray-500 mb-4">
-            Select your primary transaction and display currency. All logs and analytics will be rendered with this symbol.
-          </p>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {/* BDT Option */}
             <label
-              className={`flex items-center justify-between p-4 rounded-xl border-2 cursor-pointer transition-all ${
+              className={`flex items-center justify-between p-4 rounded-2xl border-2 cursor-pointer transition-all ${
                 formData.preferredCurrency === 'BDT'
-                  ? 'border-emerald-600 bg-emerald-50/40 text-emerald-900'
-                  : 'border-gray-200 hover:border-gray-300 bg-white'
+                  ? 'border-emerald-500 bg-emerald-500/10 text-emerald-500 shadow-sm'
+                  : 'border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700'
               }`}
             >
               <div className="flex items-center gap-3">
@@ -291,19 +352,18 @@ export default function Profile() {
                   className="w-4 h-4 text-emerald-600 focus:ring-emerald-500"
                 />
                 <div>
-                  <div className="font-semibold">Bangladeshi Taka (BDT)</div>
-                  <div className="text-xs text-gray-500">Symbol: ৳ (Local mobile banking & accounts)</div>
+                  <div className="font-bold text-sm text-slate-900 dark:text-slate-100">Bangladeshi Taka (BDT)</div>
+                  <div className="text-xs text-slate-500 dark:text-slate-400">National Standard (৳)</div>
                 </div>
               </div>
-              <span className="text-2xl font-bold text-emerald-700">৳</span>
+              <span className="text-2xl font-black text-emerald-500">৳</span>
             </label>
 
-            {/* USD Option */}
             <label
-              className={`flex items-center justify-between p-4 rounded-xl border-2 cursor-pointer transition-all ${
+              className={`flex items-center justify-between p-4 rounded-2xl border-2 cursor-pointer transition-all ${
                 formData.preferredCurrency === 'USD'
-                  ? 'border-emerald-600 bg-emerald-50/40 text-emerald-900'
-                  : 'border-gray-200 hover:border-gray-300 bg-white'
+                  ? 'border-emerald-500 bg-emerald-500/10 text-emerald-500 shadow-sm'
+                  : 'border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700'
               }`}
             >
               <div className="flex items-center gap-3">
@@ -316,32 +376,31 @@ export default function Profile() {
                   className="w-4 h-4 text-emerald-600 focus:ring-emerald-500"
                 />
                 <div>
-                  <div className="font-semibold">US Dollar (USD)</div>
-                  <div className="text-xs text-gray-500">Symbol: $ (International & card logging)</div>
+                  <div className="font-bold text-sm text-slate-900 dark:text-slate-100">US Dollar (USD)</div>
+                  <div className="text-xs text-slate-500 dark:text-slate-400">International Standard ($)</div>
                 </div>
               </div>
-              <span className="text-2xl font-bold text-emerald-700">$</span>
+              <span className="text-2xl font-black text-emerald-500">$</span>
             </label>
           </div>
         </div>
 
-        {/* Section 3: Privacy & Security Settings (R3 Integration) */}
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
-          <div className="flex items-center gap-2 mb-4 pb-3 border-b border-gray-100">
-            <Shield className="w-5 h-5 text-emerald-600" />
-            <h2 className="text-xl font-semibold text-gray-800">Privacy & Security Settings</h2>
+        {/* Security & Balance Privacy */}
+        <div className="bg-white dark:bg-[#121826] p-6 sm:p-8 rounded-3xl border border-slate-200/70 dark:border-slate-800/80 shadow-sm space-y-6 transition-colors">
+          <div className="flex items-center gap-2.5 pb-4 border-b border-slate-100 dark:border-slate-800">
+            <Shield className="w-5 h-5 text-emerald-500" />
+            <h2 className="text-base font-bold text-slate-900 dark:text-white">Privacy & Protection</h2>
           </div>
 
           <div className="space-y-6">
-            {/* Balance Masking Toggle */}
-            <div className="flex items-center justify-between py-2">
+            <div className="flex items-center justify-between">
               <div>
-                <div className="font-medium text-gray-800 flex items-center gap-2">
-                  {formData.maskBalances ? <EyeOff className="w-4 h-4 text-gray-500" /> : <Eye className="w-4 h-4 text-gray-500" />}
-                  Mask Account Balances
+                <div className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  {formData.maskBalances ? <EyeOff className="w-4 h-4 text-emerald-500" /> : <Eye className="w-4 h-4 text-slate-400" />}
+                  Mask Balances on Startup
                 </div>
-                <div className="text-xs text-gray-500">
-                  Hides sensitive balances on Dashboard (shows `••••••` instead of exact amounts).
+                <div className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  Replaces numeric amounts with dots until toggled with the eye icon.
                 </div>
               </div>
               <label className="relative inline-flex items-center cursor-pointer">
@@ -352,77 +411,34 @@ export default function Profile() {
                   onChange={handleChange}
                   className="sr-only peer"
                 />
-                <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600"></div>
+                <div className="w-11 h-6 bg-slate-200 dark:bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-500"></div>
               </label>
             </div>
 
-            {/* PIN Lock Toggle & Field */}
-            <div className="pt-4 border-t border-gray-100">
-              <div className="flex items-center justify-between py-2">
-                <div>
-                  <div className="font-medium text-gray-800 flex items-center gap-2">
-                    <Lock className="w-4 h-4 text-gray-500" />
-                    PIN-based Section Lock
-                  </div>
-                  <div className="text-xs text-gray-500">
-                    Require a 4-digit security PIN before viewing sensitive reports and logs.
-                  </div>
-                </div>
-                <label className="relative inline-flex items-center cursor-pointer">
-                  <input
-                    type="checkbox"
-                    name="pinEnabled"
-                    checked={formData.pinEnabled}
-                    onChange={handleChange}
-                    className="sr-only peer"
-                  />
-                  <div className="w-11 h-6 bg-gray-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600"></div>
-                </label>
-              </div>
-
-              {formData.pinEnabled && (
-                <div className="mt-3 pl-6 border-l-2 border-emerald-500">
-                  <label className="block text-xs font-semibold text-gray-700 uppercase tracking-wider mb-1">
-                    Set / Update 4-Digit Security PIN
-                  </label>
-                  <input
-                    type="password"
-                    maxLength={4}
-                    name="securityPin"
-                    value={formData.securityPin}
-                    onChange={handleChange}
-                    placeholder="Enter 4-digit PIN (e.g. 1234)"
-                    className="w-48 px-3 py-2 border border-gray-300 rounded-lg text-sm tracking-widest text-center focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                  />
-                  <p className="text-xs text-gray-400 mt-1">Leave blank if you want to keep your existing PIN.</p>
-                </div>
-              )}
-            </div>
-
-            {/* Optional Password Update */}
-            <div className="pt-4 border-t border-gray-100">
-              <label className="block text-sm font-medium text-gray-700 mb-1">Change Password</label>
+            <div className="pt-4 border-t border-slate-100 dark:border-slate-800">
+              <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5">
+                Update Account Password
+              </label>
               <input
                 type="password"
                 name="newPassword"
                 value={formData.newPassword}
                 onChange={handleChange}
-                placeholder="Enter new password (min. 6 characters)"
-                className="w-full sm:w-80 px-3 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                placeholder="Enter new password (optional)"
+                className="w-full sm:w-80 px-4 py-2.5 bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700/80 rounded-xl text-sm font-medium focus:outline-none focus:ring-2 focus:ring-emerald-500 text-slate-900 dark:text-slate-100"
               />
-              <p className="text-xs text-gray-400 mt-1">Leave blank to keep your current password.</p>
             </div>
           </div>
         </div>
 
-        {/* Submit Button */}
+        {/* Submit */}
         <div className="flex justify-end">
           <button
             type="submit"
             disabled={saving}
-            className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-medium rounded-xl shadow-sm transition-all focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 disabled:opacity-50"
+            className="px-8 py-3 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-extrabold rounded-2xl shadow-lg shadow-emerald-500/25 transition-all hover:scale-105 disabled:opacity-50 text-xs tracking-wider uppercase"
           >
-            {saving ? 'Saving changes...' : 'Save Profile Changes'}
+            {saving ? 'Saving...' : 'Save Profile Changes'}
           </button>
         </div>
       </form>
