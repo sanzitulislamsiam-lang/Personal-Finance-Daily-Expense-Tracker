@@ -96,7 +96,40 @@ const updateUserProfile = async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 };
+// @desc    Verify Security PIN (R3)
+// @route   POST /api/users/verify-pin
+// @access  Private
+const verifyPin = async (req, res) => {
+  try {
+    const { pin } = req.body;
+    if (!pin) {
+      return res.status(400).json({ message: 'PIN is required' });
+    }
 
+    // Get user with securityPin
+    const user = await User.findById(req.user._id).select('+privacySettings.securityPin');
+
+    if (!user.privacySettings.pinEnabled) {
+      return res.status(400).json({ message: 'PIN is not enabled for this account' });
+    }
+
+    const isMatch = await user.matchPin(pin);
+    if (!isMatch) {
+      return res.status(401).json({ valid: false, message: 'Invalid PIN' });
+    }
+
+    res.json({ valid: true, message: 'PIN verified successfully' });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// module.exports এখানে আপডেট করো:
+module.exports = {
+  getUserProfile,
+  updateUserProfile,
+  verifyPin, // <--- নতুন যোগ করা
+};
 module.exports = {
   getUserProfile,
   updateUserProfile,
