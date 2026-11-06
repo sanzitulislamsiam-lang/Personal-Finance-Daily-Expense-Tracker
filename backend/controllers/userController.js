@@ -124,12 +124,6 @@ const verifyPin = async (req, res) => {
   }
 };
 
-// module.exports এখানে আপডেট করো:
-module.exports = {
-  getUserProfile,
-  updateUserProfile,
-  verifyPin, // <--- নতুন যোগ করা
-};
 module.exports = {
   getUserProfile,
   updateUserProfile,
