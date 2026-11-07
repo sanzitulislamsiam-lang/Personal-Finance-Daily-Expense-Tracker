@@ -1,17 +1,32 @@
 import React, { useState, useEffect } from 'react';
-import { X, AlertCircle, DollarSign, Calendar, Clock, CreditCard, Tag, FileText, CheckCircle2 } from 'lucide-react';
+import {
+  X,
+  AlertCircle,
+  Calendar,
+  Clock,
+  CreditCard,
+  Tag,
+  CheckCircle2,
+  TrendingUp,
+  TrendingDown,
+} from 'lucide-react';
 import { formatCurrency } from '../../utils/formatCurrency';
 
 export default function TransactionForm({
   isOpen,
   onClose,
   onSubmit,
-  editingExpense = null,
+  type = 'Expense', // 'Expense' or 'Income'
+  editingTransaction = null,
+  editingExpense = null, // for backwards compatibility
   accounts = [],
   categories = [],
   preferredCurrency = 'BDT',
   submitting = false,
 }) {
+  const activeRecord = editingTransaction || editingExpense;
+  const isIncome = type === 'Income';
+
   const getTodayDate = () => new Date().toISOString().split('T')[0];
   const getCurrentTime = () => {
     const now = new Date();
@@ -32,18 +47,17 @@ export default function TransactionForm({
   const [error, setError] = useState('');
 
   useEffect(() => {
-    if (editingExpense) {
+    if (activeRecord) {
       setFormData({
-        amount: editingExpense.amount || '',
-        accountId: editingExpense.account?._id || editingExpense.account || '',
-        categoryId: editingExpense.category?._id || editingExpense.category || '',
-        date: editingExpense.date ? new Date(editingExpense.date).toISOString().split('T')[0] : getTodayDate(),
-        time: editingExpense.time || getCurrentTime(),
-        note: editingExpense.note || '',
-        tags: Array.isArray(editingExpense.tags) ? editingExpense.tags.join(', ') : '',
+        amount: activeRecord.amount || '',
+        accountId: activeRecord.account?._id || activeRecord.account || '',
+        categoryId: activeRecord.category?._id || activeRecord.category || '',
+        date: activeRecord.date ? new Date(activeRecord.date).toISOString().split('T')[0] : getTodayDate(),
+        time: activeRecord.time || getCurrentTime(),
+        note: activeRecord.note || '',
+        tags: Array.isArray(activeRecord.tags) ? activeRecord.tags.join(', ') : '',
       });
     } else {
-      // Default to first account and first category if available
       setFormData({
         ...initialForm,
         accountId: accounts.length > 0 ? accounts[0]._id : '',
@@ -51,33 +65,34 @@ export default function TransactionForm({
       });
     }
     setError('');
-  }, [editingExpense, isOpen, accounts, categories]);
+  }, [activeRecord, isOpen, accounts, categories]);
 
   if (!isOpen) return null;
 
   const selectedAccount = accounts.find((acc) => acc._id === formData.accountId);
   const enteredAmount = Number(formData.amount) || 0;
   const isOverdraft =
+    !isIncome &&
     selectedAccount &&
     selectedAccount.accountType !== 'Credit Card' &&
-    enteredAmount > (selectedAccount.balance + (editingExpense ? editingExpense.amount : 0));
+    enteredAmount > (selectedAccount.balance + (activeRecord ? activeRecord.amount : 0));
 
   const handleSubmit = (e) => {
     e.preventDefault();
     setError('');
 
     if (!formData.amount || enteredAmount <= 0) {
-      setError('Please provide a valid expense amount greater than 0.');
+      setError(`Please provide a valid ${isIncome ? 'income' : 'expense'} amount greater than 0.`);
       return;
     }
 
     if (!formData.accountId) {
-      setError('Please select an account to pay from.');
+      setError(`Please select an account to ${isIncome ? 'deposit into' : 'pay from'}.`);
       return;
     }
 
     if (!formData.categoryId) {
-      setError('Please choose an expense category.');
+      setError(`Please choose an ${isIncome ? 'income source' : 'expense'} category.`);
       return;
     }
 
@@ -108,12 +123,22 @@ export default function TransactionForm({
         <div className="px-6 py-5 border-b border-slate-100 dark:border-slate-800/80 flex justify-between items-center bg-slate-50/50 dark:bg-slate-800/30">
           <div>
             <h3 className="text-lg font-bold text-slate-900 dark:text-white flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />
-              {editingExpense ? 'Edit Expense Record' : 'Log Daily Expense'}
+              <span
+                className={`w-2.5 h-2.5 rounded-full animate-pulse ${
+                  isIncome ? 'bg-emerald-500' : 'bg-red-500'
+                }`}
+              />
+              {activeRecord
+                ? `Edit ${isIncome ? 'Income' : 'Expense'} Record`
+                : isIncome
+                ? 'Log New Income'
+                : 'Log Daily Expense'}
             </h3>
             <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
-              {editingExpense
-                ? 'Update expense details and balance reconciliation'
+              {activeRecord
+                ? `Update ${isIncome ? 'income' : 'expense'} details and balance reconciliation`
+                : isIncome
+                ? 'Record incoming funds and automatically credit aggregate account balance'
                 : 'Record outgoing payment and automatically deduct account balance'}
             </p>
           </div>
@@ -138,7 +163,8 @@ export default function TransactionForm({
           {/* Amount Field */}
           <div>
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 mb-1.5">
-              Expense Amount ({preferredCurrency}) <span className="text-red-500">*</span>
+              {isIncome ? 'Income Amount' : 'Expense Amount'} ({preferredCurrency}){' '}
+              <span className={isIncome ? 'text-emerald-500' : 'text-red-500'}>*</span>
             </label>
             <div className="relative">
               <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-sm">
@@ -152,13 +178,18 @@ export default function TransactionForm({
                 onChange={(e) => setFormData({ ...formData, amount: e.target.value })}
                 placeholder="0.00"
                 required
-                className="w-full pl-9 pr-4 py-2.5 text-base font-semibold bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-red-500/30 focus:border-red-500"
+                className={`w-full pl-9 pr-4 py-2.5 text-base font-semibold bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 ${
+                  isIncome
+                    ? 'focus:ring-emerald-500/30 focus:border-emerald-500'
+                    : 'focus:ring-red-500/30 focus:border-red-500'
+                }`}
               />
             </div>
             {isOverdraft && (
               <p className="mt-1 text-xs text-amber-500 dark:text-amber-400 flex items-center gap-1 font-medium">
                 <AlertCircle className="w-3.5 h-3.5" />
-                Warning: Expense exceeds current account balance ({formatCurrency(selectedAccount.balance, selectedAccount.currency)})
+                Warning: Expense exceeds current account balance (
+                {formatCurrency(selectedAccount.balance, selectedAccount.currency)})
               </p>
             )}
           </div>
@@ -166,7 +197,8 @@ export default function TransactionForm({
           {/* Account Selection */}
           <div>
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 mb-1.5">
-              Paid From Account <span className="text-red-500">*</span>
+              {isIncome ? 'Deposit To Account' : 'Paid From Account'}{' '}
+              <span className={isIncome ? 'text-emerald-500' : 'text-red-500'}>*</span>
             </label>
             <div className="relative">
               <CreditCard className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -174,14 +206,19 @@ export default function TransactionForm({
                 value={formData.accountId}
                 onChange={(e) => setFormData({ ...formData, accountId: e.target.value })}
                 required
-                className="w-full pl-10 pr-4 py-2 text-sm bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-red-500/30 focus:border-red-500"
+                className={`w-full pl-10 pr-4 py-2 text-sm bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white focus:outline-none focus:ring-2 ${
+                  isIncome
+                    ? 'focus:ring-emerald-500/30 focus:border-emerald-500'
+                    : 'focus:ring-red-500/30 focus:border-red-500'
+                }`}
               >
                 <option value="" disabled>
                   Select account...
                 </option>
                 {accounts.map((acc) => (
                   <option key={acc._id} value={acc._id}>
-                    {acc.name} — {acc.accountType} (Balance: {formatCurrency(acc.balance, acc.currency)})
+                    {acc.name} — {acc.accountType} (Current Balance:{' '}
+                    {formatCurrency(acc.balance, acc.currency)})
                   </option>
                 ))}
               </select>
@@ -191,7 +228,8 @@ export default function TransactionForm({
           {/* Category Selection */}
           <div>
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 mb-1.5">
-              Expense Category <span className="text-red-500">*</span>
+              {isIncome ? 'Income Source / Category' : 'Expense Category'}{' '}
+              <span className={isIncome ? 'text-emerald-500' : 'text-red-500'}>*</span>
             </label>
             <div className="relative">
               <Tag className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -199,7 +237,11 @@ export default function TransactionForm({
                 value={formData.categoryId}
                 onChange={(e) => setFormData({ ...formData, categoryId: e.target.value })}
                 required
-                className="w-full pl-10 pr-4 py-2 text-sm bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-red-500/30 focus:border-red-500"
+                className={`w-full pl-10 pr-4 py-2 text-sm bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white focus:outline-none focus:ring-2 ${
+                  isIncome
+                    ? 'focus:ring-emerald-500/30 focus:border-emerald-500'
+                    : 'focus:ring-red-500/30 focus:border-red-500'
+                }`}
               >
                 <option value="" disabled>
                   Select category...
@@ -217,7 +259,7 @@ export default function TransactionForm({
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 mb-1.5">
-                Date <span className="text-red-500">*</span>
+                Date <span className={isIncome ? 'text-emerald-500' : 'text-red-500'}>*</span>
               </label>
               <div className="relative">
                 <Calendar className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -226,7 +268,9 @@ export default function TransactionForm({
                   value={formData.date}
                   onChange={(e) => setFormData({ ...formData, date: e.target.value })}
                   required
-                  className="w-full pl-9 pr-3 py-2 text-xs bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-red-500/30"
+                  className={`w-full pl-9 pr-3 py-2 text-xs bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white focus:outline-none focus:ring-2 ${
+                    isIncome ? 'focus:ring-emerald-500/30' : 'focus:ring-red-500/30'
+                  }`}
                 />
               </div>
             </div>
@@ -241,7 +285,9 @@ export default function TransactionForm({
                   type="time"
                   value={formData.time}
                   onChange={(e) => setFormData({ ...formData, time: e.target.value })}
-                  className="w-full pl-9 pr-3 py-2 text-xs bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-red-500/30"
+                  className={`w-full pl-9 pr-3 py-2 text-xs bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white focus:outline-none focus:ring-2 ${
+                    isIncome ? 'focus:ring-emerald-500/30' : 'focus:ring-red-500/30'
+                  }`}
                 />
               </div>
             </div>
@@ -250,15 +296,23 @@ export default function TransactionForm({
           {/* Note / Description */}
           <div>
             <label className="block text-xs font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300 mb-1.5">
-              Notes / Description (Optional)
+              Notes / Reference (Optional)
             </label>
             <div className="relative">
               <textarea
                 value={formData.note}
                 onChange={(e) => setFormData({ ...formData, note: e.target.value })}
-                placeholder="What was this expense for? (e.g. Lunch with team, Groceries from Shwapno)"
+                placeholder={
+                  isIncome
+                    ? 'e.g., Monthly salary payment, Upwork client payout, Birthday gift'
+                    : 'What was this expense for? (e.g. Lunch with team, Groceries)'
+                }
                 rows={2}
-                className="w-full px-3.5 py-2 text-xs bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-red-500/30 focus:border-red-500"
+                className={`w-full px-3.5 py-2 text-xs bg-slate-50 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700/80 rounded-xl text-slate-900 dark:text-white placeholder-slate-400 focus:outline-none focus:ring-2 ${
+                  isIncome
+                    ? 'focus:ring-emerald-500/30 focus:border-emerald-500'
+                    : 'focus:ring-red-500/30 focus:border-red-500'
+                }`}
               />
             </div>
           </div>
@@ -276,14 +330,24 @@ export default function TransactionForm({
             <button
               type="submit"
               disabled={submitting}
-              className="px-5 py-2 text-xs font-bold text-white bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 rounded-xl shadow-lg shadow-red-500/25 flex items-center gap-1.5 transition-all transform active:scale-95 disabled:opacity-50"
+              className={`px-5 py-2 text-xs font-bold text-white rounded-xl shadow-lg flex items-center gap-1.5 transition-all transform active:scale-95 disabled:opacity-50 ${
+                isIncome
+                  ? 'bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 shadow-emerald-500/25'
+                  : 'bg-gradient-to-r from-red-600 via-rose-600 to-red-500 hover:from-red-500 hover:to-rose-500 shadow-red-500/25'
+              }`}
             >
               {submitting ? (
                 <span>Saving...</span>
               ) : (
                 <>
                   <CheckCircle2 className="w-4 h-4" />
-                  <span>{editingExpense ? 'Update Expense' : 'Log Expense'}</span>
+                  <span>
+                    {activeRecord
+                      ? `Update ${isIncome ? 'Income' : 'Expense'}`
+                      : isIncome
+                      ? 'Log Income'
+                      : 'Log Expense'}
+                  </span>
                 </>
               )}
             </button>

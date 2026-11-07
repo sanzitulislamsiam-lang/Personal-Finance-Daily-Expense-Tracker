@@ -7,6 +7,7 @@ import ProtectedRoute from './components/common/ProtectedRoute';
 import Profile from './pages/Profile';
 import Accounts from './pages/Accounts';
 import ExpenseLog from './pages/ExpenseLog';
+import IncomeLog from './pages/IncomeLog';
 import Login from './pages/Login';
 
 export default function App() {
@@ -40,6 +41,14 @@ export default function App() {
                   element={
                     <ProtectedRoute>
                       <ExpenseLog />
+                    </ProtectedRoute>
+                  }
+                />
+                <Route
+                  path="/income"
+                  element={
+                    <ProtectedRoute>
+                      <IncomeLog />
                     </ProtectedRoute>
                   }
                 />

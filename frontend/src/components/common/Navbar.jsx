@@ -2,7 +2,7 @@ import React from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
-import { User, LogOut, CreditCard, Sun, Moon, TrendingDown } from 'lucide-react';
+import { User, LogOut, CreditCard, Sun, Moon, TrendingDown, TrendingUp } from 'lucide-react';
 
 export default function Navbar() {
   const { user, logoutUser } = useAuth();
@@ -74,6 +74,18 @@ export default function Navbar() {
                 >
                   <TrendingDown className="w-3.5 h-3.5 text-red-500" />
                   Expenses
+                </Link>
+
+                <Link
+                  to="/income"
+                  className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                    isActive('/income')
+                      ? 'bg-white dark:bg-slate-700 text-emerald-600 dark:text-emerald-400 shadow-sm border border-slate-200/50 dark:border-slate-600/50'
+                      : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-white/50 dark:hover:bg-slate-700/50'
+                  }`}
+                >
+                  <TrendingUp className="w-3.5 h-3.5 text-emerald-500" />
+                  Income
                 </Link>
 
                 <Link
