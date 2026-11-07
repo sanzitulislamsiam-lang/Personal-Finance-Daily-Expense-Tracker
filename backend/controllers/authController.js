@@ -31,7 +31,7 @@ const registerUser = async (req, res) => {
         email: user.email,
         avatar: user.avatar,
         preferredCurrency: user.preferredCurrency,
-        privacySettings: user.privacySettings,
+        privacySettings: user.publicPrivacy(),
         token: generateToken(user._id),
       });
     } else {
@@ -49,7 +49,7 @@ const loginUser = async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    const user = await User.findOne({ email }).select('+password +privacySettings.securityPin');
+    const user = await User.findOne({ email }).select('+password');
     if (!user) {
       return res.status(401).json({ message: 'Invalid email or password' });
     }
@@ -65,10 +65,7 @@ const loginUser = async (req, res) => {
       email: user.email,
       avatar: user.avatar,
       preferredCurrency: user.preferredCurrency,
-      privacySettings: {
-        maskBalances: user.privacySettings.maskBalances,
-        pinEnabled: user.privacySettings.pinEnabled,
-      },
+      privacySettings: user.publicPrivacy(),
       token: generateToken(user._id),
     });
   } catch (error) {

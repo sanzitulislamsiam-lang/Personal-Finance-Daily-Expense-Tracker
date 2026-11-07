@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const LOCKABLE_SECTIONS = require('../config/lockableSections');
 
 const userSchema = new mongoose.Schema(
   {
@@ -44,6 +45,21 @@ const userSchema = new mongoose.Schema(
         type: String,
         select: false, // 4-digit hashed PIN
       },
+      // R3: which sections require the PIN (e.g. ['accounts'])
+      lockedSections: {
+        type: [{ type: String, enum: LOCKABLE_SECTIONS }],
+        default: [],
+      },
+      // R3: brute-force protection for the 4-digit PIN
+      pinFailedAttempts: {
+        type: Number,
+        default: 0,
+        select: false,
+      },
+      pinLockedUntil: {
+        type: Date,
+        select: false,
+      },
     },
   },
   {
@@ -65,7 +81,18 @@ userSchema.methods.matchPassword = async function (enteredPassword) {
 
 // Compare entered PIN with hashed PIN
 userSchema.methods.matchPin = async function (enteredPin) {
-  return await bcrypt.compare(enteredPin, this.privacySettings.securityPin);
+  if (!this.privacySettings.securityPin) return false;
+  return await bcrypt.compare(String(enteredPin), this.privacySettings.securityPin);
+};
+
+// Only these fields are ever sent to the client (never the PIN hash / attempt counters)
+userSchema.methods.publicPrivacy = function () {
+  const p = this.privacySettings || {};
+  return {
+    maskBalances: Boolean(p.maskBalances),
+    pinEnabled: Boolean(p.pinEnabled),
+    lockedSections: p.lockedSections ? Array.from(p.lockedSections) : [],
+  };
 };
 
 module.exports = mongoose.model('User', userSchema);

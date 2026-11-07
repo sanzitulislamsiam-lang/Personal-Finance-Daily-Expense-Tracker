@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { getProfile, updateProfile } from '../api/authApi';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
+import PinSecurityPanel from '../components/profile/PinSecurityPanel';
 import {
   User,
   Shield,
@@ -32,8 +33,6 @@ export default function Profile() {
     avatar: '',
     preferredCurrency: 'BDT',
     maskBalances: false,
-    pinEnabled: false,
-    securityPin: '',
     newPassword: '',
   });
 
@@ -62,8 +61,6 @@ export default function Profile() {
         avatar: data.avatar || sampleAvatars[0],
         preferredCurrency: data.preferredCurrency || 'BDT',
         maskBalances: data.privacySettings?.maskBalances || false,
-        pinEnabled: data.privacySettings?.pinEnabled || false,
-        securityPin: '',
         newPassword: '',
       });
     } catch (err) {
@@ -119,10 +116,9 @@ export default function Profile() {
         name: formData.name,
         avatar: formData.avatar,
         preferredCurrency: formData.preferredCurrency,
+        // R3: PIN & section locks are managed by <PinSecurityPanel />, not by this form
         privacySettings: {
           maskBalances: formData.maskBalances,
-          pinEnabled: formData.pinEnabled,
-          ...(formData.securityPin ? { securityPin: formData.securityPin } : {}),
         },
         ...(formData.newPassword ? { password: formData.newPassword } : {}),
       };
@@ -136,7 +132,7 @@ export default function Profile() {
         privacySettings: res.privacySettings,
       });
 
-      setFormData((prev) => ({ ...prev, securityPin: '', newPassword: '' }));
+      setFormData((prev) => ({ ...prev, newPassword: '' }));
       setNotification({ type: 'success', message: 'Profile updated successfully!' });
     } catch (err) {
       setNotification({
@@ -442,6 +438,9 @@ export default function Profile() {
           </button>
         </div>
       </form>
+
+      {/* R3: PIN lock (create / change / remove, choose locked sections) */}
+      <PinSecurityPanel />
     </div>
   );
 }

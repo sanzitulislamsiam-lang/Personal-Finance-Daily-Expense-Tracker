@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { getAccounts, createAccount, updateAccount, deleteAccount } from '../api/accountApi';
 import { useAuth } from '../context/AuthContext';
+import { usePrivacy } from '../context/PrivacyContext';
 import { formatCurrency } from '../utils/formatCurrency';
 import {
   Wallet,
@@ -27,8 +28,8 @@ export default function Accounts() {
   const [loading, setLoading] = useState(true);
   const [notification, setNotification] = useState({ type: '', message: '' });
 
-  // Masking toggle
-  const [isMasked, setIsMasked] = useState(user?.privacySettings?.maskBalances ?? false);
+  // R3: balance masking comes from the shared privacy context (also used by the Navbar eye)
+  const { balancesHidden: isMasked, toggleBalances } = usePrivacy();
 
   // Modal State
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -49,9 +50,6 @@ export default function Accounts() {
 
   useEffect(() => {
     fetchAccounts();
-    if (user?.privacySettings?.maskBalances !== undefined) {
-      setIsMasked(user.privacySettings.maskBalances);
-    }
   }, [user]);
 
   const fetchAccounts = async () => {
@@ -216,7 +214,7 @@ export default function Accounts() {
           <div className="flex items-center gap-3">
             <button
               type="button"
-              onClick={() => setIsMasked((prev) => !prev)}
+              onClick={toggleBalances}
               className="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-white/10 hover:bg-white/20 border border-white/10 text-xs font-bold backdrop-blur-md transition-all text-white"
             >
               {isMasked ? <Eye className="w-4 h-4 text-emerald-400" /> : <EyeOff className="w-4 h-4 text-slate-300" />}
@@ -361,7 +359,7 @@ export default function Accounts() {
                     </div>
                     {acc.accountType === 'Credit Card' && acc.creditLimit > 0 && (
                       <div className="text-[11px] text-white/70 mt-1">
-                        Limit: {formatCurrency(acc.creditLimit, userCurrency)}
+                        Limit: {isMasked ? '••••••' : formatCurrency(acc.creditLimit, userCurrency)}
                       </div>
                     )}
                   </div>

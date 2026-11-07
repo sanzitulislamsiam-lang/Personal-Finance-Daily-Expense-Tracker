@@ -2,11 +2,13 @@ import React from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../../context/AuthContext';
 import { useTheme } from '../../context/ThemeContext';
-import { User, LogOut, CreditCard, Sun, Moon, TrendingDown, TrendingUp } from 'lucide-react';
+import { usePrivacy } from '../../context/PrivacyContext';
+import { User, LogOut, CreditCard, Sun, Moon, Activity, Eye, EyeOff, Lock } from 'lucide-react';
 
 export default function Navbar() {
   const { user, logoutUser } = useAuth();
   const { isDark, toggleTheme } = useTheme();
+  const { balancesHidden, toggleBalances, hasActiveLocks, isUnlocked, lockNow } = usePrivacy();
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -65,30 +67,6 @@ export default function Navbar() {
                 </Link>
 
                 <Link
-                  to="/expenses"
-                  className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                    isActive('/expenses')
-                      ? 'bg-white dark:bg-slate-700 text-red-600 dark:text-red-400 shadow-sm border border-slate-200/50 dark:border-slate-600/50'
-                      : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-white/50 dark:hover:bg-slate-700/50'
-                  }`}
-                >
-                  <TrendingDown className="w-3.5 h-3.5 text-red-500" />
-                  Expenses
-                </Link>
-
-                <Link
-                  to="/income"
-                  className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
-                    isActive('/income')
-                      ? 'bg-white dark:bg-slate-700 text-emerald-600 dark:text-emerald-400 shadow-sm border border-slate-200/50 dark:border-slate-600/50'
-                      : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-white/50 dark:hover:bg-slate-700/50'
-                  }`}
-                >
-                  <TrendingUp className="w-3.5 h-3.5 text-emerald-500" />
-                  Income
-                </Link>
-
-                <Link
                   to="/profile"
                   className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
                     isActive('/profile')
@@ -113,6 +91,30 @@ export default function Navbar() {
             >
               {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4 text-slate-700" />}
             </button>
+
+            {/* R3: show / hide balances */}
+            {user && (
+              <button
+                onClick={toggleBalances}
+                className="p-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-all border border-slate-200 dark:border-slate-700"
+                title={balancesHidden ? 'Show balances' : 'Hide balances'}
+                aria-label={balancesHidden ? 'Show balances' : 'Hide balances'}
+              >
+                {balancesHidden ? <EyeOff className="w-4 h-4 text-emerald-500" /> : <Eye className="w-4 h-4" />}
+              </button>
+            )}
+
+            {/* R3: lock protected sections again right now */}
+            {user && hasActiveLocks && isUnlocked && (
+              <button
+                onClick={lockNow}
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-950/50 transition-all border border-amber-200 dark:border-amber-800/60 text-xs font-bold"
+                title="Lock protected sections now"
+              >
+                <Lock className="w-3.5 h-3.5" />
+                Lock now
+              </button>
+            )}
 
             {user ? (
               <div className="flex items-center gap-2.5">
