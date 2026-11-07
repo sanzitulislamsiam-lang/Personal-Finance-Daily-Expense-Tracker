@@ -1,0 +1,3155 @@
+diff --git a/README.md b/README.md
+index 7456e1c..d29a9c3 100644
+--- a/README.md
++++ b/README.md
+@@ -15,3 +15,28 @@
+ 
+ Tests: `cd backend && npm test` (needs local MongoDB) and `cd frontend && npm test`.
+ To lock another page: wrap it with `<PinLock section="budgets">` in `App.jsx` and add `router.use(requirePinUnlock('budgets'))` in its routes file.
++
++
++## R19 - Automated Reminders
++
++* **Settings** (Reminders page): in-app/browser notifications, e-mail reminders, daily "log your expenses" reminder at a chosen time, bill-due reminders (N days before + on the due day). Times use the user's own time zone.
++* **Bills**: add bills (one-time or monthly) with a due date. Monthly bills roll forward automatically; "mark paid" moves them to next month.
++* **How it works**: `services/cronService.js` runs `runReminderCycle()` every minute (node-cron). A unique `(user, dedupeKey)` index guarantees a reminder is never sent twice. E-mail goes through Nodemailer (`services/emailService.js`); without `SMTP_*` in `.env` mails are only printed in the server console.
++* The bell in the navbar shows unread reminders and pops a browser notification for new ones (while the app is open).
++
++| Method | Endpoint | Purpose |
++|---|---|---|
++| GET / PUT | `/api/reminders/settings` | notification settings |
++| POST | `/api/reminders/test` | send a test reminder now |
++| GET / POST | `/api/reminders` | list / add bills |
++| PUT / DELETE | `/api/reminders/:id` | edit / delete a bill |
++| POST | `/api/reminders/:id/paid` | mark a bill paid |
++| GET | `/api/notifications` | bell list + unread count |
++| PUT | `/api/notifications/:id/read`, `/read-all` | mark read |
++
++## R20 - Audit Log / Activity History
++
++* Every create / update / delete of accounts and bills, profile & security changes (PIN, privacy) and logins are recorded in `AuditLog`. Only field **names** are stored, never values (no balances, passwords or PINs).
++* **Activity** page: search, filter by action / type / date range, pagination. The log is append-only (the model refuses updates and deletes, and there are no edit/delete endpoints).
++* `GET /api/audit?action=&entityType=&from=&to=&search=&page=&limit=` - users only see their own history.
++* To log a new module (e.g. transactions): `router.post('/', audit('CREATE', 'Transaction'), createTransaction)` using `audit` from `middleware/auditMiddleware.js` (add the name to `config/auditConstants.js` if it is new). For custom events call `logActivity(req, {...})`.
+diff --git a/backend/.env.example b/backend/.env.example
+index 815a4ca..e4be1e9 100644
+--- a/backend/.env.example
++++ b/backend/.env.example
+@@ -2,3 +2,14 @@ PORT=5000
+ NODE_ENV=development
+ MONGO_URI=mongodb://127.0.0.1:27017/finance_tracker
+ JWT_SECRET=supersecret_finance_tracker_jwt_key_cse470
++
++# --- R19 reminders: e-mail (optional) ---------------------------------------
++# Leave SMTP_HOST empty and e-mails are only printed in the server console.
++# Gmail example: SMTP_HOST=smtp.gmail.com  SMTP_PORT=587  SMTP_USER=you@gmail.com
++#                SMTP_PASS=<Gmail "App password">  (Google Account > Security > 2-Step Verification > App passwords)
++SMTP_HOST=
++SMTP_PORT=587
++SMTP_SECURE=false
++SMTP_USER=
++SMTP_PASS=
++EMAIL_FROM=Finance Tracker <no-reply@finance-tracker.local>
+diff --git a/backend/app.js b/backend/app.js
+index da89438..b2d402d 100644
+--- a/backend/app.js
++++ b/backend/app.js
+@@ -13,6 +13,9 @@ app.use(express.urlencoded({ limit: '10mb', extended: true }));
+ app.use('/api/auth', require('./routes/authRoutes'));
+ app.use('/api/users', require('./routes/userRoutes'));
+ app.use('/api/accounts', require('./routes/accountRoutes'));
++app.use('/api/audit', require('./routes/auditRoutes')); // R20
++app.use('/api/reminders', require('./routes/reminderRoutes')); // R19
++app.use('/api/notifications', require('./routes/notificationRoutes')); // R19
+ 
+ // Health check endpoint
+ app.get('/', (req, res) => {
+diff --git a/backend/config/auditConstants.js b/backend/config/auditConstants.js
+new file mode 100644
+index 0000000..02b0360
+--- /dev/null
++++ b/backend/config/auditConstants.js
+@@ -0,0 +1,19 @@
++// R20: what can appear in the activity history
++const AUDIT_ACTIONS = ['CREATE', 'UPDATE', 'DELETE', 'LOGIN'];
++
++// Add a new name here when a new module (Transaction, Budget, ...) starts writing audit logs
++const AUDIT_ENTITIES = [
++  'Account',
++  'Transaction',
++  'Category',
++  'Budget',
++  'Goal',
++  'Debt',
++  'SplitBill',
++  'Reminder',
++  'Profile',
++  'Security',
++  'Auth',
++];
++
++module.exports = { AUDIT_ACTIONS, AUDIT_ENTITIES };
+diff --git a/backend/controllers/accountController.js b/backend/controllers/accountController.js
+index e39a635..9814d5f 100644
+--- a/backend/controllers/accountController.js
++++ b/backend/controllers/accountController.js
+@@ -127,6 +127,7 @@ const deleteAccount = async (req, res) => {
+     account.isActive = false;
+     await account.save();
+ 
++    res.locals.auditLabel = account.name; // R20: shown in the activity history
+     res.json({ message: 'Account removed successfully', id: req.params.id });
+   } catch (error) {
+     res.status(500).json({ message: error.message });
+diff --git a/backend/controllers/auditController.js b/backend/controllers/auditController.js
+index e69de29..c840fba 100644
+--- a/backend/controllers/auditController.js
++++ b/backend/controllers/auditController.js
+@@ -0,0 +1,70 @@
++const AuditLog = require('../models/AuditLog');
++const { AUDIT_ACTIONS, AUDIT_ENTITIES } = require('../config/auditConstants');
++
++const escapeRegex = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++
++// "2026-11-07" -> Date, or null when it is not a real date
++const parseDay = (value) => {
++  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
++  const d = new Date(`${value}T00:00:00.000Z`);
++  return Number.isNaN(d.getTime()) ? null : d;
++};
++
++// @desc    Activity history of the logged-in user (newest first), with filters + pagination (R20)
++// @route   GET /api/audit?action=&entityType=&from=&to=&search=&page=&limit=
++// @access  Private
++const getAuditLogs = async (req, res) => {
++  try {
++    const { action, entityType, from, to, search } = req.query;
++    const query = { user: req.user._id }; // users can only ever see their own history
++
++    if (action) {
++      if (!AUDIT_ACTIONS.includes(action)) {
++        return res.status(400).json({ message: `action must be one of: ${AUDIT_ACTIONS.join(', ')}` });
++      }
++      query.action = action;
++    }
++
++    if (entityType) {
++      if (!AUDIT_ENTITIES.includes(entityType)) {
++        return res.status(400).json({ message: `entityType must be one of: ${AUDIT_ENTITIES.join(', ')}` });
++      }
++      query.entityType = entityType;
++    }
++
++    if (from || to) {
++      query.timestamp = {};
++      if (from) {
++        const d = parseDay(from);
++        if (!d) return res.status(400).json({ message: 'from must be a date like 2026-11-01' });
++        query.timestamp.$gte = d;
++      }
++      if (to) {
++        const d = parseDay(to);
++        if (!d) return res.status(400).json({ message: 'to must be a date like 2026-11-30' });
++        query.timestamp.$lt = new Date(d.getTime() + 24 * 60 * 60 * 1000); // whole "to" day included
++      }
++    }
++
++    if (search && String(search).trim()) {
++      query.description = { $regex: escapeRegex(String(search).trim().slice(0, 100)), $options: 'i' };
++    }
++
++    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
++    const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
++
++    const [total, logs] = await Promise.all([
++      AuditLog.countDocuments(query),
++      AuditLog.find(query)
++        .sort({ timestamp: -1, _id: -1 })
++        .skip((page - 1) * limit)
++        .limit(limit),
++    ]);
++
++    res.json({ logs, page, limit, total, pages: Math.max(Math.ceil(total / limit), 1) });
++  } catch (error) {
++    res.status(500).json({ message: error.message });
++  }
++};
++
++module.exports = { getAuditLogs };
+diff --git a/backend/controllers/authController.js b/backend/controllers/authController.js
+index 98d2189..3c13e54 100644
+--- a/backend/controllers/authController.js
++++ b/backend/controllers/authController.js
+@@ -1,5 +1,6 @@
+ const User = require('../models/User');
+ const generateToken = require('../utils/generateToken');
++const { logActivity } = require('../middleware/auditMiddleware');
+ 
+ // @desc    Register a new user
+ // @route   POST /api/auth/register
+@@ -59,6 +60,15 @@ const loginUser = async (req, res) => {
+       return res.status(401).json({ message: 'Invalid email or password' });
+     }
+ 
++    // R20: record the login in the activity history
++    await logActivity(req, {
++      user: user._id,
++      action: 'LOGIN',
++      entityType: 'Auth',
++      entityId: user._id,
++      description: 'Logged in',
++    });
++
+     res.json({
+       _id: user._id,
+       name: user.name,
+diff --git a/backend/controllers/notificationController.js b/backend/controllers/notificationController.js
+new file mode 100644
+index 0000000..f7ca30e
+--- /dev/null
++++ b/backend/controllers/notificationController.js
+@@ -0,0 +1,52 @@
++const mongoose = require('mongoose');
++const Notification = require('../models/Notification');
++
++// @desc    My in-app notifications (newest first) + how many are unread
++// @route   GET /api/notifications?unreadOnly=true&limit=20
++const getNotifications = async (req, res) => {
++  try {
++    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
++    const base = { user: req.user._id, inApp: true };
++    const query = req.query.unreadOnly === 'true' ? { ...base, isRead: false } : base;
++
++    const [notifications, unreadCount] = await Promise.all([
++      Notification.find(query).sort({ createdAt: -1, _id: -1 }).limit(limit),
++      Notification.countDocuments({ ...base, isRead: false }),
++    ]);
++    res.json({ notifications, unreadCount });
++  } catch (error) {
++    res.status(500).json({ message: error.message });
++  }
++};
++
++// @route PUT /api/notifications/:id/read
++const markRead = async (req, res) => {
++  try {
++    if (!mongoose.isValidObjectId(req.params.id)) {
++      return res.status(404).json({ message: 'Notification not found' });
++    }
++    const result = await Notification.updateOne(
++      { _id: req.params.id, user: req.user._id },
++      { $set: { isRead: true } }
++    );
++    if (result.matchedCount === 0) return res.status(404).json({ message: 'Notification not found' });
++    res.json({ message: 'Marked as read' });
++  } catch (error) {
++    res.status(500).json({ message: error.message });
++  }
++};
++
++// @route PUT /api/notifications/read-all
++const markAllRead = async (req, res) => {
++  try {
++    const result = await Notification.updateMany(
++      { user: req.user._id, inApp: true, isRead: false },
++      { $set: { isRead: true } }
++    );
++    res.json({ message: 'All marked as read', updated: result.modifiedCount });
++  } catch (error) {
++    res.status(500).json({ message: error.message });
++  }
++};
++
++module.exports = { getNotifications, markRead, markAllRead };
+diff --git a/backend/controllers/reminderController.js b/backend/controllers/reminderController.js
+new file mode 100644
+index 0000000..b4f7326
+--- /dev/null
++++ b/backend/controllers/reminderController.js
+@@ -0,0 +1,231 @@
++const mongoose = require('mongoose');
++const User = require('../models/User');
++const Reminder = require('../models/Reminder');
++const { logActivity } = require('../middleware/auditMiddleware');
++const {
++  deliver,
++  isRealDate,
++  isValidTimeZone,
++  daysBetween,
++  addMonth,
++  getLocalParts,
++} = require('../services/reminderService');
++
++const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
++const isBool = (v) => typeof v === 'boolean';
++
++// ---------------------------------------------------------------------------
++// notification settings
++// ---------------------------------------------------------------------------
++
++// @route GET /api/reminders/settings
++const getSettings = async (req, res) => {
++  res.json(req.user.publicReminders());
++};
++
++// @route PUT /api/reminders/settings
++const updateSettings = async (req, res) => {
++  try {
++    const b = req.body;
++    const $set = {};
++
++    for (const key of ['emailEnabled', 'pushEnabled', 'dailyLogReminder', 'billReminders']) {
++      if (b[key] !== undefined) {
++        if (!isBool(b[key])) return res.status(400).json({ message: `${key} must be true or false` });
++        $set[`reminderSettings.${key}`] = b[key];
++      }
++    }
++    if (b.dailyLogTime !== undefined) {
++      if (typeof b.dailyLogTime !== 'string' || !TIME_RE.test(b.dailyLogTime)) {
++        return res.status(400).json({ message: 'dailyLogTime must look like 20:00 (24-hour HH:MM)' });
++      }
++      $set['reminderSettings.dailyLogTime'] = b.dailyLogTime;
++    }
++    if (b.billNotifyDaysBefore !== undefined) {
++      const n = b.billNotifyDaysBefore;
++      if (!Number.isInteger(n) || n < 0 || n > 30) {
++        return res.status(400).json({ message: 'billNotifyDaysBefore must be a whole number from 0 to 30' });
++      }
++      $set['reminderSettings.billNotifyDaysBefore'] = n;
++    }
++    if (b.timezone !== undefined) {
++      if (!isValidTimeZone(b.timezone)) {
++        return res.status(400).json({ message: 'timezone is not valid (example: Asia/Dhaka)' });
++      }
++      $set['reminderSettings.timezone'] = b.timezone;
++    }
++    if (Object.keys($set).length === 0) {
++      return res.status(400).json({ message: 'Nothing to update' });
++    }
++
++    await User.updateOne({ _id: req.user._id }, { $set });
++    const updated = await User.findById(req.user._id);
++
++    await logActivity(req, {
++      action: 'UPDATE',
++      entityType: 'Reminder',
++      entityId: req.user._id,
++      description: 'Updated reminder settings',
++      changedFields: Object.keys($set).map((k) => k.replace('reminderSettings.', '')),
++    });
++
++    res.json({ ...updated.publicReminders(), message: 'Reminder settings saved' });
++  } catch (error) {
++    res.status(500).json({ message: error.message });
++  }
++};
++
++// @route POST /api/reminders/test  - sends a test notification right now (to check the setup)
++const sendTest = async (req, res) => {
++  try {
++    const user = await User.findById(req.user._id);
++    const key = `test:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
++    const { status, notification } = await deliver(user, {
++      type: 'test',
++      title: 'Test reminder',
++      message: 'This is a test reminder from your Finance Tracker. Everything is working!',
++      dedupeKey: key,
++    });
++
++    if (status === 'skipped') {
++      return res
++        .status(400)
++        .json({ message: 'Turn on e-mail or in-app notifications first, then send a test.' });
++    }
++    res.json({
++      message: 'Test reminder sent',
++      inApp: notification.inApp,
++      emailStatus: notification.emailStatus,
++    });
++  } catch (error) {
++    res.status(500).json({ message: error.message });
++  }
++};
++
++// ---------------------------------------------------------------------------
++// bills
++// ---------------------------------------------------------------------------
++const findOwnBill = async (req) => {
++  if (!mongoose.isValidObjectId(req.params.id)) return null;
++  return Reminder.findOne({ _id: req.params.id, user: req.user._id });
++};
++
++// returns an error message, or null when the fields are fine. Only checks fields that are present.
++const validateBill = (b, { creating }) => {
++  if (creating || b.title !== undefined) {
++    if (typeof b.title !== 'string' || !b.title.trim()) return 'Title is required';
++    if (b.title.trim().length > 100) return 'Title must be 100 characters or less';
++  }
++  if (creating || b.dueDate !== undefined) {
++    if (typeof b.dueDate !== 'string' || !isRealDate(b.dueDate)) return 'dueDate must be a real date like 2026-12-01';
++  }
++  if (b.amount !== undefined && (typeof b.amount !== 'number' || !Number.isFinite(b.amount) || b.amount < 0)) {
++    return 'amount must be a number that is 0 or more';
++  }
++  if (b.repeat !== undefined && !['none', 'monthly'].includes(b.repeat)) return 'repeat must be none or monthly';
++  if (b.isActive !== undefined && !isBool(b.isActive)) return 'isActive must be true or false';
++  if (b.notes !== undefined && (typeof b.notes !== 'string' || b.notes.length > 300)) {
++    return 'notes must be text of 300 characters or less';
++  }
++  return null;
++};
++
++// @route GET /api/reminders
++const listReminders = async (req, res) => {
++  try {
++    const bills = await Reminder.find({ user: req.user._id }).sort({ dueDate: 1 });
++    const today = getLocalParts(new Date(), req.user.publicReminders().timezone).date;
++    res.json(bills.map((b) => ({ ...b.toObject(), daysLeft: daysBetween(today, b.dueDate) })));
++  } catch (error) {
++    res.status(500).json({ message: error.message });
++  }
++};
++
++// @route POST /api/reminders
++const createReminder = async (req, res) => {
++  try {
++    const problem = validateBill(req.body, { creating: true });
++    if (problem) return res.status(400).json({ message: problem });
++
++    const { title, amount, dueDate, repeat, notes } = req.body;
++    const bill = await Reminder.create({
++      user: req.user._id,
++      title: title.trim(),
++      amount: amount || 0,
++      dueDate,
++      dueDay: Number(dueDate.slice(8)),
++      repeat: repeat || 'none',
++      notes,
++    });
++    res.status(201).json(bill);
++  } catch (error) {
++    res.status(500).json({ message: error.message });
++  }
++};
++
++// @route PUT /api/reminders/:id
++const updateReminder = async (req, res) => {
++  try {
++    const bill = await findOwnBill(req);
++    if (!bill) return res.status(404).json({ message: 'Reminder not found' });
++
++    const problem = validateBill(req.body, { creating: false });
++    if (problem) return res.status(400).json({ message: problem });
++
++    const b = req.body;
++    if (b.title !== undefined) bill.title = b.title.trim();
++    if (b.amount !== undefined) bill.amount = b.amount;
++    if (b.repeat !== undefined) bill.repeat = b.repeat;
++    if (b.notes !== undefined) bill.notes = b.notes;
++    if (b.isActive !== undefined) bill.isActive = b.isActive;
++    if (b.dueDate !== undefined) {
++      bill.dueDate = b.dueDate;
++      bill.dueDay = Number(b.dueDate.slice(8));
++    }
++    res.json(await bill.save());
++  } catch (error) {
++    res.status(500).json({ message: error.message });
++  }
++};
++
++// @route DELETE /api/reminders/:id
++const deleteReminder = async (req, res) => {
++  try {
++    const bill = await findOwnBill(req);
++    if (!bill) return res.status(404).json({ message: 'Reminder not found' });
++    await Reminder.deleteOne({ _id: bill._id });
++    res.locals.auditLabel = bill.title;
++    res.json({ message: 'Reminder deleted', id: String(bill._id) });
++  } catch (error) {
++    res.status(500).json({ message: error.message });
++  }
++};
++
++// @route POST /api/reminders/:id/paid
++// monthly bill -> moves to next month; one-time bill -> switched off
++const markPaid = async (req, res) => {
++  try {
++    const bill = await findOwnBill(req);
++    if (!bill) return res.status(404).json({ message: 'Reminder not found' });
++
++    if (bill.repeat === 'monthly') {
++      bill.dueDate = addMonth(bill.dueDate, bill.dueDay || Number(bill.dueDate.slice(8)));
++    } else {
++      bill.isActive = false;
++    }
++    res.json(await bill.save());
++  } catch (error) {
++    res.status(500).json({ message: error.message });
++  }
++};
++
++module.exports = {
++  getSettings,
++  updateSettings,
++  sendTest,
++  listReminders,
++  createReminder,
++  updateReminder,
++  deleteReminder,
++  markPaid,
++};
+diff --git a/backend/controllers/userController.js b/backend/controllers/userController.js
+index 19e7cf7..bb6867b 100644
+--- a/backend/controllers/userController.js
++++ b/backend/controllers/userController.js
+@@ -2,6 +2,7 @@ const mongoose = require('mongoose');
+ const User = require('../models/User');
+ const bcrypt = require('bcryptjs');
+ const LOCKABLE_SECTIONS = require('../config/lockableSections');
++const { logActivity } = require('../middleware/auditMiddleware');
+ const { generateUnlockToken, UNLOCK_TTL_SECONDS } = require('../utils/pinToken');
+ 
+ // ---------------------------------------------------------------------------
+@@ -166,6 +167,15 @@ const updateUserProfile = async (req, res) => {
+ 
+     const updatedUser = await user.save();
+ 
++    // R20: only field names are logged, never values
++    await logActivity(req, {
++      action: 'UPDATE',
++      entityType: 'Profile',
++      entityId: req.user._id,
++      description: 'Updated profile',
++      changedFields: Object.keys(req.body || {}).map((k) => (k === 'privacySettings' ? 'maskBalances' : k)),
++    });
++
+     res.json({
+       _id: updatedUser._id,
+       name: updatedUser.name,
+@@ -230,6 +240,13 @@ const updatePrivacySettings = async (req, res) => {
+ 
+     await User.updateOne({ _id: req.user._id }, { $set });
+     const updated = await User.findById(req.user._id);
++    await logActivity(req, {
++      action: 'UPDATE',
++      entityType: 'Security',
++      entityId: req.user._id,
++      description: 'Updated privacy settings',
++      changedFields: Object.keys($set).map((k) => k.replace('privacySettings.', '')),
++    });
+     res.json({
+       privacySettings: updated.publicPrivacy(),
+       message: 'Privacy settings updated',
+@@ -269,10 +286,17 @@ const setPin = async (req, res) => {
+       }
+     );
+     const updated = await User.findById(req.user._id);
++    const wasChange = req.user.privacySettings.pinEnabled;
++    await logActivity(req, {
++      action: wasChange ? 'UPDATE' : 'CREATE',
++      entityType: 'Security',
++      entityId: req.user._id,
++      description: wasChange ? 'Changed security PIN' : 'Created security PIN',
++    });
+ 
+     res.json({
+       privacySettings: updated.publicPrivacy(),
+-      message: req.user.privacySettings.pinEnabled ? 'PIN changed successfully' : 'PIN created successfully',
++      message: wasChange ? 'PIN changed successfully' : 'PIN created successfully',
+     });
+   } catch (error) {
+     res.status(500).json({ message: error.message });
+@@ -307,6 +331,12 @@ const removePin = async (req, res) => {
+       }
+     );
+     const updated = await User.findById(req.user._id);
++    await logActivity(req, {
++      action: 'DELETE',
++      entityType: 'Security',
++      entityId: req.user._id,
++      description: 'Removed security PIN',
++    });
+ 
+     res.json({ privacySettings: updated.publicPrivacy(), message: 'PIN removed' });
+   } catch (error) {
+diff --git a/backend/middleware/auditMiddleware.js b/backend/middleware/auditMiddleware.js
+index e69de29..728c44b 100644
+--- a/backend/middleware/auditMiddleware.js
++++ b/backend/middleware/auditMiddleware.js
+@@ -0,0 +1,61 @@
++const AuditLog = require('../models/AuditLog');
++
++// Names shown to the user in descriptions
++const ENTITY_LABELS = { SplitBill: 'split bill', Reminder: 'bill reminder' };
++const VERBS = { CREATE: 'Created', UPDATE: 'Updated', DELETE: 'Deleted', LOGIN: 'Logged in' };
++
++// Core function: write one audit row.
++// NEVER throws - a problem in the audit log must not break the user's real request.
++// data: { action, entityType, entityId?, description?, changedFields?, transactionId?, user? }
++const logActivity = async (req, data) => {
++  try {
++    const userId = data.user || (req.user && req.user._id);
++    if (!userId) return null;
++    return await AuditLog.create({
++      user: userId,
++      action: data.action,
++      entityType: data.entityType,
++      entityId: data.entityId ? String(data.entityId) : undefined,
++      description: String(data.description || `${VERBS[data.action]} ${data.entityType}`).slice(0, 300),
++      changedFields: data.changedFields || [],
++      transactionId: data.transactionId,
++      ipAddress: req.ip,
++    });
++  } catch (error) {
++    console.error('[audit] could not write audit log:', error.message);
++    return null;
++  }
++};
++
++// Route-level helper, e.g.   router.post('/', audit('CREATE', 'Account'), createAccount)
++// After the controller answers with a 2xx status it automatically logs the action.
++// Entity id  = _id of the JSON response, or :id from the URL.
++// Label      = res.locals.auditLabel (set by the controller) or name/title of the response.
++const audit = (action, entityType) => (req, res, next) => {
++  let responseBody;
++  const originalJson = res.json.bind(res);
++  res.json = (body) => {
++    responseBody = body;
++    return originalJson(body);
++  };
++
++  res.on('finish', () => {
++    if (res.statusCode >= 400) return; // failed requests are not activity
++
++    const body = responseBody && typeof responseBody === 'object' ? responseBody : {};
++    const label = res.locals.auditLabel || body.name || body.title;
++    const entityName = ENTITY_LABELS[entityType] || entityType.toLowerCase();
++
++    logActivity(req, {
++      action,
++      entityType,
++      entityId: body._id || body.id || req.params.id,
++      description: `${VERBS[action]} ${entityName}${label ? ` "${label}"` : ''}`,
++      changedFields: action === 'UPDATE' ? Object.keys(req.body || {}) : [],
++    });
++  });
++
++  next();
++};
++
++module.exports = { logActivity, audit };
+diff --git a/backend/models/AuditLog.js b/backend/models/AuditLog.js
+index e69de29..9b369aa 100644
+--- a/backend/models/AuditLog.js
++++ b/backend/models/AuditLog.js
+@@ -0,0 +1,39 @@
++const mongoose = require('mongoose');
++const { AUDIT_ACTIONS, AUDIT_ENTITIES } = require('../config/auditConstants');
++
++// R20: one row = one thing a user did (created / updated / deleted / logged in).
++// Only field NAMES are stored in changedFields - never values (so no passwords, PINs or balances leak).
++const auditLogSchema = new mongoose.Schema(
++  {
++    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
++    action: { type: String, enum: AUDIT_ACTIONS, required: true },
++    entityType: { type: String, enum: AUDIT_ENTITIES, required: true },
++    entityId: { type: String },
++    description: { type: String, required: true, maxlength: 300 },
++    changedFields: { type: [String], default: [] },
++    transactionId: { type: mongoose.Schema.Types.ObjectId }, // set when the entry belongs to a transaction
++    ipAddress: { type: String },
++    timestamp: { type: Date, default: Date.now },
++  },
++  { versionKey: false }
++);
++
++// fast "my latest activity" queries
++auditLogSchema.index({ user: 1, timestamp: -1 });
++
++// Integrity: an audit log is append-only. Updating or deleting rows is refused.
++const blocked = function () {
++  throw new Error('Audit logs are read-only and cannot be modified or deleted');
++};
++[
++  'updateOne',
++  'updateMany',
++  'findOneAndUpdate',
++  'findOneAndReplace',
++  'replaceOne',
++  'deleteOne',
++  'deleteMany',
++  'findOneAndDelete',
++].forEach((op) => auditLogSchema.pre(op, blocked));
++
++module.exports = mongoose.model('AuditLog', auditLogSchema);
+diff --git a/backend/models/Notification.js b/backend/models/Notification.js
+new file mode 100644
+index 0000000..3ae4eec
+--- /dev/null
++++ b/backend/models/Notification.js
+@@ -0,0 +1,24 @@
++const mongoose = require('mongoose');
++
++// R19: one notification = one reminder that was triggered for a user.
++// The unique (user, dedupeKey) index guarantees the same reminder is never sent twice,
++// even if the scheduler runs again or the server restarts.
++const notificationSchema = new mongoose.Schema(
++  {
++    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
++    type: { type: String, enum: ['daily_log', 'bill_due', 'test'], required: true },
++    title: { type: String, required: true },
++    message: { type: String, required: true },
++    inApp: { type: Boolean, default: true }, // shown in the bell / browser notification?
++    isRead: { type: Boolean, default: false },
++    emailStatus: { type: String, enum: ['not_requested', 'sent', 'failed'], default: 'not_requested' },
++    reminder: { type: mongoose.Schema.Types.ObjectId, ref: 'Reminder' },
++    dedupeKey: { type: String, required: true },
++  },
++  { timestamps: true }
++);
++
++notificationSchema.index({ user: 1, dedupeKey: 1 }, { unique: true });
++notificationSchema.index({ user: 1, createdAt: -1 });
++
++module.exports = mongoose.model('Notification', notificationSchema);
+diff --git a/backend/models/Reminder.js b/backend/models/Reminder.js
+new file mode 100644
+index 0000000..8713d31
+--- /dev/null
++++ b/backend/models/Reminder.js
+@@ -0,0 +1,19 @@
++const mongoose = require('mongoose');
++
++// R19: a bill the user wants to be reminded about (rent, Netflix, internet ...).
++// dueDate is a plain calendar date "YYYY-MM-DD" (no time zone problems).
++const reminderSchema = new mongoose.Schema(
++  {
++    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
++    title: { type: String, required: true, trim: true, maxlength: 100 },
++    amount: { type: Number, default: 0, min: 0 },
++    dueDate: { type: String, required: true, match: /^\d{4}-\d{2}-\d{2}$/ },
++    dueDay: { type: Number, min: 1, max: 31 }, // original day of month, so Jan 31 -> Feb 28 -> Mar 31 (no drift)
++    repeat: { type: String, enum: ['none', 'monthly'], default: 'none' },
++    notes: { type: String, trim: true, maxlength: 300 },
++    isActive: { type: Boolean, default: true },
++  },
++  { timestamps: true }
++);
++
++module.exports = mongoose.model('Reminder', reminderSchema);
+diff --git a/backend/models/User.js b/backend/models/User.js
+index 203c8df..bebcf2b 100644
+--- a/backend/models/User.js
++++ b/backend/models/User.js
+@@ -61,6 +61,17 @@ const userSchema = new mongoose.Schema(
+         select: false,
+       },
+     },
++
++    // R19: automated reminders
++    reminderSettings: {
++      emailEnabled: { type: Boolean, default: false }, // send e-mails
++      pushEnabled: { type: Boolean, default: true }, // in-app bell + browser notifications
++      dailyLogReminder: { type: Boolean, default: false }, // "log today's expenses"
++      dailyLogTime: { type: String, default: '20:00', match: /^([01]\d|2[0-3]):[0-5]\d$/ },
++      billReminders: { type: Boolean, default: true }, // bill-due reminders
++      billNotifyDaysBefore: { type: Number, default: 2, min: 0, max: 30 },
++      timezone: { type: String, default: 'Asia/Dhaka' }, // so "20:00" means the user's 20:00
++    },
+   },
+   {
+     timestamps: true,
+@@ -95,4 +106,18 @@ userSchema.methods.publicPrivacy = function () {
+   };
+ };
+ 
++// R19: reminder settings as sent to the client
++userSchema.methods.publicReminders = function () {
++  const r = this.reminderSettings || {};
++  return {
++    emailEnabled: Boolean(r.emailEnabled),
++    pushEnabled: r.pushEnabled !== false,
++    dailyLogReminder: Boolean(r.dailyLogReminder),
++    dailyLogTime: r.dailyLogTime || '20:00',
++    billReminders: r.billReminders !== false,
++    billNotifyDaysBefore: r.billNotifyDaysBefore ?? 2,
++    timezone: r.timezone || 'Asia/Dhaka',
++  };
++};
++
+ module.exports = mongoose.model('User', userSchema);
+diff --git a/backend/routes/accountRoutes.js b/backend/routes/accountRoutes.js
+index 870af23..e6d2689 100644
+--- a/backend/routes/accountRoutes.js
++++ b/backend/routes/accountRoutes.js
+@@ -9,17 +9,19 @@ const {
+ } = require('../controllers/accountController');
+ const { protect } = require('../middleware/authMiddleware');
+ const { requirePinUnlock } = require('../middleware/pinMiddleware');
++const { audit } = require('../middleware/auditMiddleware');
+ 
+ router.use(protect); // All account routes require authentication
+ router.use(requirePinUnlock('accounts')); // R3: PIN lock (only if the user locked "accounts")
+ 
++// R20: create / update / delete are written to the activity history
+ router.route('/')
+   .get(getAccounts)
+-  .post(createAccount);
++  .post(audit('CREATE', 'Account'), createAccount);
+ 
+ router.route('/:id')
+   .get(getAccountById)
+-  .put(updateAccount)
+-  .delete(deleteAccount);
++  .put(audit('UPDATE', 'Account'), updateAccount)
++  .delete(audit('DELETE', 'Account'), deleteAccount);
+ 
+ module.exports = router;
+diff --git a/backend/routes/auditRoutes.js b/backend/routes/auditRoutes.js
+index e69de29..b57ee0e 100644
+--- a/backend/routes/auditRoutes.js
++++ b/backend/routes/auditRoutes.js
+@@ -0,0 +1,9 @@
++const express = require('express');
++const router = express.Router();
++const { getAuditLogs } = require('../controllers/auditController');
++const { protect } = require('../middleware/authMiddleware');
++
++// R20: read-only. There is deliberately no POST / PUT / DELETE - the history cannot be edited.
++router.get('/', protect, getAuditLogs);
++
++module.exports = router;
+diff --git a/backend/routes/notificationRoutes.js b/backend/routes/notificationRoutes.js
+new file mode 100644
+index 0000000..5387143
+--- /dev/null
++++ b/backend/routes/notificationRoutes.js
+@@ -0,0 +1,12 @@
++const express = require('express');
++const router = express.Router();
++const { getNotifications, markRead, markAllRead } = require('../controllers/notificationController');
++const { protect } = require('../middleware/authMiddleware');
++
++router.use(protect);
++
++router.get('/', getNotifications);
++router.put('/read-all', markAllRead); // before "/:id/read"
++router.put('/:id/read', markRead);
++
++module.exports = router;
+diff --git a/backend/routes/reminderRoutes.js b/backend/routes/reminderRoutes.js
+new file mode 100644
+index 0000000..e860c05
+--- /dev/null
++++ b/backend/routes/reminderRoutes.js
+@@ -0,0 +1,18 @@
++const express = require('express');
++const router = express.Router();
++const c = require('../controllers/reminderController');
++const { protect } = require('../middleware/authMiddleware');
++const { audit } = require('../middleware/auditMiddleware');
++
++router.use(protect);
++
++// R19: notification settings + test button (must come before "/:id")
++router.route('/settings').get(c.getSettings).put(c.updateSettings);
++router.post('/test', c.sendTest);
++
++// R19: bill reminders (create / update / delete / mark paid are written to the activity history - R20)
++router.route('/').get(c.listReminders).post(audit('CREATE', 'Reminder'), c.createReminder);
++router.post('/:id/paid', audit('UPDATE', 'Reminder'), c.markPaid);
++router.route('/:id').put(audit('UPDATE', 'Reminder'), c.updateReminder).delete(audit('DELETE', 'Reminder'), c.deleteReminder);
++
++module.exports = router;
+diff --git a/backend/server.js b/backend/server.js
+index fbd0b41..7d44fa1 100644
+--- a/backend/server.js
++++ b/backend/server.js
+@@ -1,11 +1,12 @@
+ const dotenv = require('dotenv');
+ const connectDB = require('./config/db');
++const { startCronJobs } = require('./services/cronService');
+ 
+ // Load environment variables
+ dotenv.config();
+ 
+-// Connect to MongoDB
+-connectDB();
++// Connect to MongoDB, then start the reminder scheduler (R19)
++connectDB().then(startCronJobs);
+ 
+ const app = require('./app');
+ 
+diff --git a/backend/services/cronService.js b/backend/services/cronService.js
+index e69de29..3a80802 100644
+--- a/backend/services/cronService.js
++++ b/backend/services/cronService.js
+@@ -0,0 +1,20 @@
++const cron = require('node-cron');
++const { runReminderCycle } = require('./reminderService');
++
++// R19: runs the reminder check once every minute.
++// Started from server.js only (never from app.js), so tests do not start timers.
++const startCronJobs = () => {
++  cron.schedule('* * * * *', async () => {
++    try {
++      const summary = await runReminderCycle();
++      if (summary.daily || summary.bills) {
++        console.log(`[cron] reminders sent: ${summary.daily} daily, ${summary.bills} bill`);
++      }
++    } catch (error) {
++      console.error('[cron] reminder cycle failed:', error.message);
++    }
++  });
++  console.log('[cron] reminder scheduler started (every minute)');
++};
++
++module.exports = { startCronJobs };
+diff --git a/backend/services/emailService.js b/backend/services/emailService.js
+index e69de29..f0cba43 100644
+--- a/backend/services/emailService.js
++++ b/backend/services/emailService.js
+@@ -0,0 +1,49 @@
++const nodemailer = require('nodemailer');
++
++// R19: e-mail sending (Nodemailer).
++// Set SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS in .env to send real e-mails
++// (Gmail, SendGrid SMTP, Mailtrap ...). Without SMTP_HOST the mail is only printed
++// to the console ("dev mode"), so the app works without any e-mail account.
++let transporter = null;
++
++const buildTransporter = () => {
++  if (process.env.SMTP_HOST) {
++    return nodemailer.createTransport({
++      host: process.env.SMTP_HOST,
++      port: Number(process.env.SMTP_PORT || 587),
++      secure: process.env.SMTP_SECURE === 'true', // true for port 465
++      auth: process.env.SMTP_USER
++        ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
++        : undefined,
++    });
++  }
++  return nodemailer.createTransport({ jsonTransport: true });
++};
++
++const getTransporter = () => {
++  if (!transporter) transporter = buildTransporter();
++  return transporter;
++};
++
++// used by tests to plug in a fake transporter (pass null to reset)
++const setTransporter = (t) => {
++  transporter = t;
++};
++
++const isRealEmailConfigured = () => Boolean(process.env.SMTP_HOST);
++
++const sendEmail = async ({ to, subject, text, html }) => {
++  const info = await getTransporter().sendMail({
++    from: process.env.EMAIL_FROM || 'Finance Tracker <no-reply@finance-tracker.local>',
++    to,
++    subject,
++    text,
++    html,
++  });
++  if (!isRealEmailConfigured() && process.env.NODE_ENV !== 'test') {
++    console.log(`[email:dev-mode] to=${to} | ${subject}\n${text}`);
++  }
++  return info;
++};
++
++module.exports = { sendEmail, setTransporter, isRealEmailConfigured };
+diff --git a/backend/services/reminderService.js b/backend/services/reminderService.js
+new file mode 100644
+index 0000000..b75fa66
+--- /dev/null
++++ b/backend/services/reminderService.js
+@@ -0,0 +1,201 @@
++const User = require('../models/User');
++const Reminder = require('../models/Reminder');
++const Notification = require('../models/Notification');
++const { sendEmail } = require('./emailService');
++
++const BILL_REMINDER_HOUR = 9; // bill reminders go out from 09:00 (user's local time)
++const DAILY_WINDOW_MINUTES = 5; // daily reminder may fire up to 5 min late (e.g. after a restart)
++
++// ---------------------------------------------------------------------------
++// date helpers - all calendar dates are plain "YYYY-MM-DD" strings
++// ---------------------------------------------------------------------------
++const pad = (n) => String(n).padStart(2, '0');
++const daysInMonth = (year, month) => new Date(Date.UTC(year, month, 0)).getUTCDate(); // month 1-12
++const makeDate = (y, m, d) => `${y}-${pad(m)}-${pad(Math.min(d, daysInMonth(y, m)))}`;
++
++const isRealDate = (str) => {
++  if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return false;
++  const [y, m, d] = str.split('-').map(Number);
++  return m >= 1 && m <= 12 && d >= 1 && d <= daysInMonth(y, m);
++};
++
++const daysBetween = (fromStr, toStr) =>
++  Math.round((Date.parse(`${toStr}T00:00:00Z`) - Date.parse(`${fromStr}T00:00:00Z`)) / 86400000);
++
++// the same day-of-month in the following month (clamped: 31st -> 28th/29th/30th)
++const addMonth = (dateStr, dueDay) => {
++  const [y, m] = dateStr.split('-').map(Number);
++  return m === 12 ? makeDate(y + 1, 1, dueDay) : makeDate(y, m + 1, dueDay);
++};
++
++// first date >= today that falls on dueDay
++const nextOccurrenceOnOrAfter = (dueDay, todayStr) => {
++  const [y, m] = todayStr.split('-').map(Number);
++  const candidate = makeDate(y, m, dueDay);
++  return candidate >= todayStr ? candidate : addMonth(candidate, dueDay);
++};
++
++// "now" as the user sees it: { date: 'YYYY-MM-DD', minutes: minutes since midnight }
++const getLocalParts = (now, timeZone) => {
++  const parts = new Intl.DateTimeFormat('en-CA', {
++    timeZone,
++    year: 'numeric',
++    month: '2-digit',
++    day: '2-digit',
++    hour: '2-digit',
++    minute: '2-digit',
++    hourCycle: 'h23',
++  }).formatToParts(now);
++  const get = (type) => parts.find((p) => p.type === type).value;
++  return {
++    date: `${get('year')}-${get('month')}-${get('day')}`,
++    minutes: Number(get('hour')) * 60 + Number(get('minute')),
++  };
++};
++
++const isValidTimeZone = (tz) => {
++  try {
++    new Intl.DateTimeFormat('en', { timeZone: tz });
++    return typeof tz === 'string' && tz.length > 0;
++  } catch (e) {
++    return false;
++  }
++};
++
++const toMinutes = (hhmm) => {
++  const [h, m] = hhmm.split(':').map(Number);
++  return h * 60 + m;
++};
++
++// ---------------------------------------------------------------------------
++// delivery
++// ---------------------------------------------------------------------------
++const emailHtml = (title, message) =>
++  `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:24px;border:1px solid #e2e8f0;border-radius:12px">
++     <h2 style="color:#059669;margin-top:0">${title}</h2>
++     <p style="color:#334155;font-size:15px;line-height:1.5">${message}</p>
++     <p style="color:#94a3b8;font-size:12px">Personal Finance &amp; Daily Expense Tracker - you can change reminders in your Reminders page.</p>
++   </div>`;
++
++// Creates the notification (and sends the e-mail) unless this exact reminder was already sent.
++// Returns { status: 'sent' | 'duplicate' | 'skipped', notification }
++const deliver = async (user, { type, title, message, dedupeKey, reminderId }, sendMail = sendEmail) => {
++  const settings = user.reminderSettings || {};
++  const wantsEmail = Boolean(settings.emailEnabled);
++  const wantsInApp = settings.pushEnabled !== false;
++  if (!wantsEmail && !wantsInApp) return { status: 'skipped' };
++
++  let notification;
++  try {
++    notification = await Notification.create({
++      user: user._id,
++      type,
++      title,
++      message,
++      inApp: wantsInApp,
++      reminder: reminderId,
++      dedupeKey,
++    });
++  } catch (error) {
++    if (error.code === 11000) return { status: 'duplicate' }; // already sent earlier
++    throw error;
++  }
++
++  if (wantsEmail) {
++    try {
++      await sendMail({ to: user.email, subject: title, text: message, html: emailHtml(title, message) });
++      notification.emailStatus = 'sent';
++    } catch (error) {
++      console.error(`[reminders] e-mail to ${user.email} failed: ${error.message}`);
++      notification.emailStatus = 'failed';
++    }
++    await notification.save();
++  }
++  return { status: 'sent', notification };
++};
++
++// ---------------------------------------------------------------------------
++// the scheduler tick (called every minute by services/cronService.js)
++// ---------------------------------------------------------------------------
++const runReminderCycle = async ({ now = new Date(), sendMail = sendEmail } = {}) => {
++  const summary = { daily: 0, bills: 0, rolled: 0 };
++
++  const users = await User.find({
++    $or: [{ 'reminderSettings.emailEnabled': true }, { 'reminderSettings.pushEnabled': { $ne: false } }],
++  });
++
++  for (const user of users) {
++    try {
++      const settings = user.publicReminders();
++      const local = getLocalParts(now, isValidTimeZone(settings.timezone) ? settings.timezone : 'Asia/Dhaka');
++
++      // 1) daily "log your expenses" reminder
++      if (settings.dailyLogReminder) {
++        const late = local.minutes - toMinutes(settings.dailyLogTime);
++        if (late >= 0 && late < DAILY_WINDOW_MINUTES) {
++          const result = await deliver(
++            user,
++            {
++              type: 'daily_log',
++              title: 'Time to log your expenses',
++              message: "Don't forget to record today's income and expenses so your budget stays accurate.",
++              dedupeKey: `daily:${local.date}`,
++            },
++            sendMail
++          );
++          if (result.status === 'sent') summary.daily += 1;
++        }
++      }
++
++      // 2) bills: roll finished monthly bills forward, then notify
++      const bills = await Reminder.find({ user: user._id, isActive: true });
++      for (const bill of bills) {
++        if (bill.repeat === 'monthly' && bill.dueDate < local.date) {
++          bill.dueDate = nextOccurrenceOnOrAfter(bill.dueDay || Number(bill.dueDate.slice(8)), local.date);
++          await bill.save();
++          summary.rolled += 1;
++        }
++
++        if (!settings.billReminders || local.minutes < BILL_REMINDER_HOUR * 60) continue;
++
++        const daysLeft = daysBetween(local.date, bill.dueDate);
++        const isDueToday = daysLeft === 0;
++        const isAdvanceDay = daysLeft > 0 && daysLeft === settings.billNotifyDaysBefore;
++        if (!isDueToday && !isAdvanceDay) continue;
++
++        const money = bill.amount > 0 ? ` (amount: ${bill.amount})` : '';
++        const result = await deliver(
++          user,
++          {
++            type: 'bill_due',
++            title: isDueToday ? `Bill due today: ${bill.title}` : `Bill due in ${daysLeft} day(s): ${bill.title}`,
++            message: isDueToday
++              ? `"${bill.title}" is due today${money}.`
++              : `"${bill.title}" is due on ${bill.dueDate}${money}.`,
++            dedupeKey: `bill:${bill._id}:${bill.dueDate}:${daysLeft}`,
++            reminderId: bill._id,
++          },
++          sendMail
++        );
++        if (result.status === 'sent') summary.bills += 1;
++      }
++    } catch (error) {
++      // one user's problem must never stop reminders for everybody else
++      console.error(`[reminders] failed for user ${user._id}: ${error.message}`);
++    }
++  }
++
++  return summary;
++};
++
++module.exports = {
++  runReminderCycle,
++  deliver,
++  isRealDate,
++  isValidTimeZone,
++  daysBetween,
++  addMonth,
++  makeDate,
++  nextOccurrenceOnOrAfter,
++  getLocalParts,
++};
+diff --git a/backend/tests/r19.reminders.test.js b/backend/tests/r19.reminders.test.js
+new file mode 100644
+index 0000000..5c36abe
+--- /dev/null
++++ b/backend/tests/r19.reminders.test.js
+@@ -0,0 +1,529 @@
++/**
++ * R19 - Automated Reminders tests
++ *  - notification settings API
++ *  - bill reminders CRUD
++ *  - the scheduler cycle (daily "log your expenses" + bill due) with a fake clock and fake mailer
++ *  - in-app notifications API
++ * Needs a local MongoDB (uses the separate finance_tracker_test database).
++ */
++process.env.JWT_SECRET = 'test_secret';
++process.env.NODE_ENV = 'test';
++delete process.env.SMTP_HOST;
++const mongoose = require('mongoose');
++const request = require('supertest');
++const app = require('../app');
++const User = require('../models/User');
++const Reminder = require('../models/Reminder');
++const Notification = require('../models/Notification');
++const AuditLog = require('../models/AuditLog');
++const emailService = require('../services/emailService');
++const { runReminderCycle, getLocalParts, addMonth, nextOccurrenceOnOrAfter, daysBetween } = require('../services/reminderService');
++
++const TEST_URI = process.env.TEST_MONGO_URI || 'mongodb://127.0.0.1:27017/finance_tracker_test';
++const auth = (token) => ({ Authorization: `Bearer ${token}` });
++let counter = 0;
++
++const newUser = async () => {
++  counter += 1;
++  const res = await request(app)
++    .post('/api/auth/register')
++    .send({ name: `Rem User ${counter}`, email: `rem${counter}@test.com`, password: 'secret123' });
++  expect(res.status).toBe(201);
++  return { token: res.body.token, id: res.body._id, email: res.body.email };
++};
++
++// a user created straight in the DB with the given reminder settings (for scheduler tests)
++const dbUser = async (settings = {}) => {
++  counter += 1;
++  return User.create({
++    name: `Cron User ${counter}`,
++    email: `cron${counter}@test.com`,
++    password: 'secret123',
++    reminderSettings: settings,
++  });
++};
++
++const bill = (user, fields = {}) =>
++  Reminder.create({
++    user: user._id,
++    title: 'Internet',
++    amount: 1200,
++    dueDate: '2026-11-10',
++    dueDay: 10,
++    repeat: 'none',
++    ...fields,
++  });
++
++const mailer = () => jest.fn().mockResolvedValue({ messageId: 'x' });
++const notes = (user) => Notification.find({ user: user._id }).sort({ createdAt: 1 });
++const addDays = (dateStr, n) => new Date(Date.parse(`${dateStr}T00:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
++
++// Dhaka is UTC+6 (no daylight saving)
++const dhaka = (date, hhmm) => new Date(`${date}T${hhmm}:00+06:00`);
++
++beforeAll(async () => {
++  await mongoose.connect(TEST_URI);
++  await mongoose.connection.dropDatabase();
++  await Notification.init(); // builds the unique (user, dedupeKey) index
++  await AuditLog.init();
++});
++
++afterEach(() => emailService.setTransporter(null));
++
++afterAll(async () => {
++  await mongoose.connection.dropDatabase();
++  await mongoose.disconnect();
++});
++
++describe('R19 - date helpers', () => {
++  test('addMonth keeps the original day (31st -> 28th -> 31st) without drifting', () => {
++    expect(addMonth('2026-01-31', 31)).toBe('2026-02-28');
++    expect(addMonth('2026-02-28', 31)).toBe('2026-03-31');
++    expect(addMonth('2028-01-31', 31)).toBe('2028-02-29'); // leap year
++    expect(addMonth('2026-12-15', 15)).toBe('2027-01-15');
++  });
++
++  test('nextOccurrenceOnOrAfter', () => {
++    expect(nextOccurrenceOnOrAfter(10, '2026-11-07')).toBe('2026-11-10');
++    expect(nextOccurrenceOnOrAfter(5, '2026-11-07')).toBe('2026-12-05');
++    expect(nextOccurrenceOnOrAfter(31, '2026-11-07')).toBe('2026-11-30');
++    expect(nextOccurrenceOnOrAfter(7, '2026-11-07')).toBe('2026-11-07');
++  });
++
++  test('daysBetween and local time in a time zone', () => {
++    expect(daysBetween('2026-11-07', '2026-11-10')).toBe(3);
++    expect(daysBetween('2026-11-10', '2026-11-07')).toBe(-3);
++    expect(getLocalParts(new Date('2026-11-07T14:00:00Z'), 'Asia/Dhaka')).toEqual({ date: '2026-11-07', minutes: 20 * 60 });
++    expect(getLocalParts(new Date('2026-11-07T20:30:00Z'), 'Asia/Dhaka')).toEqual({ date: '2026-11-08', minutes: 150 });
++  });
++});
++
++describe('R19 - notification settings API', () => {
++  test('defaults', async () => {
++    const u = await newUser();
++    const res = await request(app).get('/api/reminders/settings').set(auth(u.token));
++    expect(res.status).toBe(200);
++    expect(res.body).toEqual({
++      emailEnabled: false,
++      pushEnabled: true,
++      dailyLogReminder: false,
++      dailyLogTime: '20:00',
++      billReminders: true,
++      billNotifyDaysBefore: 2,
++      timezone: 'Asia/Dhaka',
++    });
++  });
++
++  test('settings are saved and returned', async () => {
++    const u = await newUser();
++    const put = await request(app)
++      .put('/api/reminders/settings')
++      .set(auth(u.token))
++      .send({ emailEnabled: true, dailyLogReminder: true, dailyLogTime: '07:45', billNotifyDaysBefore: 5, timezone: 'Europe/London' });
++    expect(put.status).toBe(200);
++    expect(put.body).toMatchObject({ emailEnabled: true, dailyLogReminder: true, dailyLogTime: '07:45', billNotifyDaysBefore: 5, timezone: 'Europe/London', pushEnabled: true });
++
++    const get = await request(app).get('/api/reminders/settings').set(auth(u.token));
++    expect(get.body.dailyLogTime).toBe('07:45');
++    expect(get.body.timezone).toBe('Europe/London');
++  });
++
++  test.each([
++    [{ dailyLogTime: '25:00' }],
++    [{ dailyLogTime: '8:00' }],
++    [{ dailyLogTime: 'noon' }],
++    [{ billNotifyDaysBefore: -1 }],
++    [{ billNotifyDaysBefore: 31 }],
++    [{ billNotifyDaysBefore: 1.5 }],
++    [{ billNotifyDaysBefore: '2' }],
++    [{ timezone: 'Mars/Phobos' }],
++    [{ emailEnabled: 'yes' }],
++    [{ pushEnabled: 1 }],
++    [{}],
++  ])('invalid settings %j are rejected', async (body) => {
++    const u = await newUser();
++    const res = await request(app).put('/api/reminders/settings').set(auth(u.token)).send(body);
++    expect(res.status).toBe(400);
++  });
++
++  test('requires login', async () => {
++    expect((await request(app).get('/api/reminders/settings')).status).toBe(401);
++    expect((await request(app).put('/api/reminders/settings').send({ emailEnabled: true })).status).toBe(401);
++  });
++
++  test('saving settings shows up in the activity history (R20)', async () => {
++    const u = await newUser();
++    await request(app).put('/api/reminders/settings').set(auth(u.token)).send({ emailEnabled: true });
++    let log;
++    for (let i = 0; i < 40 && !log; i++) {
++      log = await AuditLog.findOne({ user: u.id });
++      if (!log) await new Promise((r) => setTimeout(r, 25));
++    }
++    expect(log).toMatchObject({ action: 'UPDATE', entityType: 'Reminder', description: 'Updated reminder settings' });
++    expect(log.changedFields).toEqual(['emailEnabled']);
++  });
++});
++
++describe('R19 - bill reminders API', () => {
++  test('create, list (only mine, with daysLeft), update, mark paid, delete', async () => {
++    const a = await newUser();
++    const b = await newUser();
++    const today = getLocalParts(new Date(), 'Asia/Dhaka').date;
++    const due = addDays(today, 4);
++
++    const created = await request(app)
++      .post('/api/reminders')
++      .set(auth(a.token))
++      .send({ title: '  House rent ', amount: 15000, dueDate: due, repeat: 'monthly' });
++    expect(created.status).toBe(201);
++    expect(created.body).toMatchObject({ title: 'House rent', amount: 15000, dueDate: due, repeat: 'monthly', isActive: true });
++    expect(created.body.dueDay).toBe(Number(due.slice(8)));
++    const id = created.body._id;
++
++    await request(app).post('/api/reminders').set(auth(b.token)).send({ title: 'B bill', dueDate: due });
++
++    const list = await request(app).get('/api/reminders').set(auth(a.token));
++    expect(list.status).toBe(200);
++    expect(list.body).toHaveLength(1);
++    expect(list.body[0].daysLeft).toBe(4);
++
++    const upd = await request(app).put(`/api/reminders/${id}`).set(auth(a.token)).send({ amount: 16000, isActive: false });
++    expect(upd.status).toBe(200);
++    expect(upd.body).toMatchObject({ amount: 16000, isActive: false });
++
++    const paid = await request(app).post(`/api/reminders/${id}/paid`).set(auth(a.token));
++    expect(paid.status).toBe(200);
++    expect(paid.body.dueDate).toBe(addMonth(due, Number(due.slice(8))));
++
++    const del = await request(app).delete(`/api/reminders/${id}`).set(auth(a.token));
++    expect(del.status).toBe(200);
++    expect((await request(app).get('/api/reminders').set(auth(a.token))).body).toHaveLength(0);
++  });
++
++  test('mark paid on a one-time bill switches it off', async () => {
++    const u = await newUser();
++    const c = await request(app).post('/api/reminders').set(auth(u.token)).send({ title: 'Once', dueDate: '2030-01-15' });
++    const paid = await request(app).post(`/api/reminders/${c.body._id}/paid`).set(auth(u.token));
++    expect(paid.body).toMatchObject({ isActive: false, dueDate: '2030-01-15' });
++  });
++
++  test.each([
++    [{ dueDate: '2026-12-01' }, 'missing title'],
++    [{ title: '   ', dueDate: '2026-12-01' }, 'blank title'],
++    [{ title: 'x'.repeat(101), dueDate: '2026-12-01' }, 'title too long'],
++    [{ title: 'Rent' }, 'missing dueDate'],
++    [{ title: 'Rent', dueDate: '2026-02-30' }, 'impossible date'],
++    [{ title: 'Rent', dueDate: '01/12/2026' }, 'wrong date format'],
++    [{ title: 'Rent', dueDate: '2026-12-01', amount: -5 }, 'negative amount'],
++    [{ title: 'Rent', dueDate: '2026-12-01', amount: '100' }, 'amount as text'],
++    [{ title: 'Rent', dueDate: '2026-12-01', repeat: 'weekly' }, 'unknown repeat'],
++  ])('create rejects %j (%s)', async (body) => {
++    const u = await newUser();
++    const res = await request(app).post('/api/reminders').set(auth(u.token)).send(body);
++    expect(res.status).toBe(400);
++  });
++
++  test("other users' bills and bad ids are 404", async () => {
++    const a = await newUser();
++    const b = await newUser();
++    const c = await request(app).post('/api/reminders').set(auth(a.token)).send({ title: 'Mine', dueDate: '2030-01-15' });
++    const id = c.body._id;
++    expect((await request(app).put(`/api/reminders/${id}`).set(auth(b.token)).send({ amount: 1 })).status).toBe(404);
++    expect((await request(app).delete(`/api/reminders/${id}`).set(auth(b.token))).status).toBe(404);
++    expect((await request(app).post(`/api/reminders/${id}/paid`).set(auth(b.token))).status).toBe(404);
++    expect((await request(app).delete('/api/reminders/not-an-id').set(auth(a.token))).status).toBe(404);
++    expect(await Reminder.countDocuments({ _id: id })).toBe(1);
++  });
++
++  test('requires login', async () => {
++    expect((await request(app).get('/api/reminders')).status).toBe(401);
++    expect((await request(app).post('/api/reminders').send({ title: 'x', dueDate: '2030-01-01' })).status).toBe(401);
++  });
++
++  test('bill changes show up in the activity history (R20)', async () => {
++    const u = await newUser();
++    const c = await request(app).post('/api/reminders').set(auth(u.token)).send({ title: 'Netflix', dueDate: '2030-01-15' });
++    await request(app).delete(`/api/reminders/${c.body._id}`).set(auth(u.token));
++    let logs = [];
++    for (let i = 0; i < 40 && logs.length < 2; i++) {
++      logs = await AuditLog.find({ user: u.id }).sort({ timestamp: 1 });
++      if (logs.length < 2) await new Promise((r) => setTimeout(r, 25));
++    }
++    expect(logs.map((l) => l.description)).toEqual(['Created bill reminder "Netflix"', 'Deleted bill reminder "Netflix"']);
++  });
++});
++
++describe('R19 - scheduler: daily "log your expenses" reminder', () => {
++  // the scheduler looks at ALL users, so every scheduler test starts from an empty database
++  beforeEach(async () => {
++    await Promise.all([User.deleteMany({}), Reminder.deleteMany({}), Notification.deleteMany({})]);
++  });
++  const settings = { emailEnabled: true, pushEnabled: true, dailyLogReminder: true, dailyLogTime: '20:00', timezone: 'Asia/Dhaka' };
++
++  test('fires at the chosen local time, sends e-mail + in-app notification', async () => {
++    const user = await dbUser(settings);
++    const sendMail = mailer();
++    const r = await runReminderCycle({ now: dhaka('2026-11-07', '20:00'), sendMail });
++    expect(r.daily).toBe(1);
++    expect(sendMail).toHaveBeenCalledTimes(1);
++    expect(sendMail.mock.calls[0][0]).toMatchObject({ to: user.email, subject: 'Time to log your expenses' });
++
++    const [n] = await notes(user);
++    expect(n).toMatchObject({ type: 'daily_log', inApp: true, isRead: false, emailStatus: 'sent' });
++  });
++
++  test('is not sent twice for the same day (dedupe), but is sent again the next day', async () => {
++    const user = await dbUser(settings);
++    const sendMail = mailer();
++    await runReminderCycle({ now: dhaka('2026-11-07', '20:00'), sendMail });
++    await runReminderCycle({ now: dhaka('2026-11-07', '20:00'), sendMail });
++    await runReminderCycle({ now: dhaka('2026-11-07', '20:03'), sendMail });
++    expect(await Notification.countDocuments({ user: user._id })).toBe(1);
++    expect(sendMail).toHaveBeenCalledTimes(1);
++
++    await runReminderCycle({ now: dhaka('2026-11-08', '20:00'), sendMail });
++    expect(await Notification.countDocuments({ user: user._id })).toBe(2);
++  });
++
++  test('only inside the time window (not before, not 5+ minutes late)', async () => {
++    const user = await dbUser(settings);
++    const sendMail = mailer();
++    expect((await runReminderCycle({ now: dhaka('2026-11-07', '19:59'), sendMail })).daily).toBe(0);
++    expect((await runReminderCycle({ now: dhaka('2026-11-07', '20:05'), sendMail })).daily).toBe(0);
++    expect((await runReminderCycle({ now: dhaka('2026-11-07', '23:00'), sendMail })).daily).toBe(0);
++    expect(await Notification.countDocuments({ user: user._id })).toBe(0);
++    expect((await runReminderCycle({ now: dhaka('2026-11-07', '20:04'), sendMail })).daily).toBe(1);
++  });
++
++  test("uses the user's own time zone", async () => {
++    const user = await dbUser({ ...settings, dailyLogTime: '08:00', timezone: 'America/New_York' });
++    const sendMail = mailer();
++    // 12:00 UTC = 07:00 New York (EST) -> too early; 13:00 UTC = 08:00 New York -> fires
++    expect((await runReminderCycle({ now: new Date('2026-11-07T12:00:00Z'), sendMail })).daily).toBe(0);
++    expect((await runReminderCycle({ now: new Date('2026-11-07T13:00:00Z'), sendMail })).daily).toBe(1);
++    expect(await Notification.countDocuments({ user: user._id })).toBe(1);
++  });
++
++  test('e-mail only: no bell notification, but the e-mail goes out', async () => {
++    const user = await dbUser({ ...settings, pushEnabled: false });
++    const sendMail = mailer();
++    await runReminderCycle({ now: dhaka('2026-11-07', '20:00'), sendMail });
++    expect(sendMail).toHaveBeenCalledTimes(1);
++    const [n] = await notes(user);
++    expect(n.inApp).toBe(false);
++  });
++
++  test('in-app only: no e-mail is sent', async () => {
++    const user = await dbUser({ ...settings, emailEnabled: false });
++    const sendMail = mailer();
++    await runReminderCycle({ now: dhaka('2026-11-07', '20:00'), sendMail });
++    expect(sendMail).not.toHaveBeenCalled();
++    const [n] = await notes(user);
++    expect(n).toMatchObject({ inApp: true, emailStatus: 'not_requested' });
++  });
++
++  test('both channels off, or daily reminder off: nothing happens', async () => {
++    const off = await dbUser({ ...settings, emailEnabled: false, pushEnabled: false });
++    const noDaily = await dbUser({ ...settings, dailyLogReminder: false });
++    const sendMail = mailer();
++    const r = await runReminderCycle({ now: dhaka('2026-11-07', '20:00'), sendMail });
++    expect(await Notification.countDocuments({ user: off._id })).toBe(0);
++    expect(await Notification.countDocuments({ user: noDaily._id })).toBe(0);
++    expect(r.daily).toBe(0);
++  });
++
++  test('a failing e-mail does not stop the cycle; it is marked as failed', async () => {
++    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++    const user = await dbUser(settings);
++    const sendMail = jest.fn().mockRejectedValue(new Error('SMTP down'));
++    const r = await runReminderCycle({ now: dhaka('2026-11-07', '20:00'), sendMail });
++    expect(r.daily).toBe(1);
++    const [n] = await notes(user);
++    expect(n).toMatchObject({ inApp: true, emailStatus: 'failed' });
++    errSpy.mockRestore();
++  });
++});
++
++describe('R19 - scheduler: bill due reminders', () => {
++  // the scheduler looks at ALL users, so every scheduler test starts from an empty database
++  beforeEach(async () => {
++    await Promise.all([User.deleteMany({}), Reminder.deleteMany({}), Notification.deleteMany({})]);
++  });
++  const settings = { emailEnabled: true, pushEnabled: true, dailyLogReminder: false, billReminders: true, billNotifyDaysBefore: 3, timezone: 'Asia/Dhaka' };
++
++  test('notifies N days before, from 09:00 local time, only once', async () => {
++    const user = await dbUser(settings);
++    await bill(user, { dueDate: '2026-11-10', amount: 1200 });
++    const sendMail = mailer();
++
++    expect((await runReminderCycle({ now: dhaka('2026-11-07', '08:59'), sendMail })).bills).toBe(0);
++    expect((await runReminderCycle({ now: dhaka('2026-11-07', '09:00'), sendMail })).bills).toBe(1);
++    expect((await runReminderCycle({ now: dhaka('2026-11-07', '09:01'), sendMail })).bills).toBe(0);
++    expect((await runReminderCycle({ now: dhaka('2026-11-07', '18:00'), sendMail })).bills).toBe(0);
++
++    const all = await notes(user);
++    expect(all).toHaveLength(1);
++    expect(all[0]).toMatchObject({ type: 'bill_due', title: 'Bill due in 3 day(s): Internet' });
++    expect(all[0].message).toContain('2026-11-10');
++    expect(all[0].message).toContain('1200');
++    expect(sendMail).toHaveBeenCalledTimes(1);
++  });
++
++  test('also notifies on the due day, and stays quiet on the days in between', async () => {
++    const user = await dbUser(settings);
++    await bill(user, { dueDate: '2026-11-10' });
++    const sendMail = mailer();
++    const quiet = ['2026-11-08', '2026-11-09']; // 2 and 1 day(s) left
++    for (const day of quiet) {
++      expect((await runReminderCycle({ now: dhaka(day, '10:00'), sendMail })).bills).toBe(0);
++    }
++    expect((await runReminderCycle({ now: dhaka('2026-11-10', '10:00'), sendMail })).bills).toBe(1);
++    const all = await notes(user);
++    expect(all[0].title).toBe('Bill due today: Internet');
++  });
++
++  test('a late first run on the day still notifies (server was down at 09:00)', async () => {
++    const user = await dbUser(settings);
++    await bill(user, { dueDate: '2026-11-10' });
++    const r = await runReminderCycle({ now: dhaka('2026-11-07', '15:30'), sendMail: mailer() });
++    expect(r.bills).toBe(1);
++    expect(await Notification.countDocuments({ user: user._id })).toBe(1);
++  });
++
++  test('paused bills, billReminders off, and other users are ignored', async () => {
++    const owner = await dbUser(settings);
++    const other = await dbUser(settings);
++    const off = await dbUser({ ...settings, billReminders: false });
++    await bill(owner, { dueDate: '2026-11-10', isActive: false });
++    await bill(off, { dueDate: '2026-11-10' });
++    const sendMail = mailer();
++    await runReminderCycle({ now: dhaka('2026-11-07', '10:00'), sendMail });
++    expect(await Notification.countDocuments({ user: owner._id })).toBe(0);
++    expect(await Notification.countDocuments({ user: off._id })).toBe(0);
++    expect(await Notification.countDocuments({ user: other._id })).toBe(0);
++  });
++
++  test('a past monthly bill rolls forward to the next due date (even before 09:00)', async () => {
++    const user = await dbUser(settings);
++    const b = await bill(user, { dueDate: '2026-10-31', dueDay: 31, repeat: 'monthly' });
++    const once = await bill(user, { title: 'Old one-time', dueDate: '2026-10-01', dueDay: 1, repeat: 'none' });
++    const r = await runReminderCycle({ now: dhaka('2026-11-07', '06:00'), sendMail: mailer() });
++    expect(r.rolled).toBe(1);
++    expect((await Reminder.findById(b._id)).dueDate).toBe('2026-11-30');
++    expect((await Reminder.findById(once._id)).dueDate).toBe('2026-10-01'); // one-time bills stay as they are
++  });
++
++  test('each reminder is a separate notification (two bills, same day)', async () => {
++    const user = await dbUser(settings);
++    await bill(user, { title: 'Rent', dueDate: '2026-11-10' });
++    await bill(user, { title: 'Netflix', dueDate: '2026-11-10' });
++    const r = await runReminderCycle({ now: dhaka('2026-11-07', '09:30'), sendMail: mailer() });
++    expect(r.bills).toBe(2);
++    expect(await Notification.countDocuments({ user: user._id })).toBe(2);
++  });
++});
++
++describe('R19 - in-app notifications API', () => {
++  test('list, unread count, unreadOnly, mark read, mark all read', async () => {
++    const u = await newUser();
++    await request(app).put('/api/reminders/settings').set(auth(u.token)).send({ pushEnabled: true });
++    for (let i = 0; i < 3; i++) await request(app).post('/api/reminders/test').set(auth(u.token));
++
++    const list = await request(app).get('/api/notifications').set(auth(u.token));
++    expect(list.status).toBe(200);
++    expect(list.body.notifications).toHaveLength(3);
++    expect(list.body.unreadCount).toBe(3);
++
++    const firstId = list.body.notifications[0]._id;
++    expect((await request(app).put(`/api/notifications/${firstId}/read`).set(auth(u.token))).status).toBe(200);
++    const after = await request(app).get('/api/notifications').set(auth(u.token));
++    expect(after.body.unreadCount).toBe(2);
++    const unreadOnly = await request(app).get('/api/notifications?unreadOnly=true').set(auth(u.token));
++    expect(unreadOnly.body.notifications).toHaveLength(2);
++
++    const all = await request(app).put('/api/notifications/read-all').set(auth(u.token));
++    expect(all.status).toBe(200);
++    expect((await request(app).get('/api/notifications').set(auth(u.token))).body.unreadCount).toBe(0);
++  });
++
++  test('limit is applied; newest first', async () => {
++    const u = await newUser();
++    for (let i = 0; i < 4; i++) await request(app).post('/api/reminders/test').set(auth(u.token));
++    const res = await request(app).get('/api/notifications?limit=2').set(auth(u.token));
++    expect(res.body.notifications).toHaveLength(2);
++    const t = res.body.notifications.map((n) => new Date(n.createdAt).getTime());
++    expect(t[0]).toBeGreaterThanOrEqual(t[1]);
++  });
++
++  test("users cannot see or touch each other's notifications", async () => {
++    const a = await newUser();
++    const b = await newUser();
++    await request(app).post('/api/reminders/test').set(auth(a.token));
++    const aList = await request(app).get('/api/notifications').set(auth(a.token));
++    const id = aList.body.notifications[0]._id;
++
++    expect((await request(app).get('/api/notifications').set(auth(b.token))).body.notifications).toHaveLength(0);
++    expect((await request(app).put(`/api/notifications/${id}/read`).set(auth(b.token))).status).toBe(404);
++    expect((await request(app).put('/api/notifications/garbage/read').set(auth(a.token))).status).toBe(404);
++    await request(app).put('/api/notifications/read-all').set(auth(b.token));
++    expect((await request(app).get('/api/notifications').set(auth(a.token))).body.unreadCount).toBe(1);
++  });
++
++  test('e-mail-only notifications are not shown in the bell', async () => {
++    const u = await newUser();
++    await request(app).put('/api/reminders/settings').set(auth(u.token)).send({ pushEnabled: false, emailEnabled: true });
++    emailService.setTransporter({ sendMail: jest.fn().mockResolvedValue({}) });
++    const test = await request(app).post('/api/reminders/test').set(auth(u.token));
++    expect(test.status).toBe(200);
++    const list = await request(app).get('/api/notifications').set(auth(u.token));
++    expect(list.body.notifications).toHaveLength(0);
++    expect(list.body.unreadCount).toBe(0);
++  });
++
++  test('requires login', async () => {
++    expect((await request(app).get('/api/notifications')).status).toBe(401);
++    expect((await request(app).put('/api/notifications/read-all')).status).toBe(401);
++  });
++});
++
++describe('R19 - "send test reminder" and the e-mail service', () => {
++  test('test reminder reaches the e-mail transport with the right recipient', async () => {
++    const u = await newUser();
++    const sendMail = jest.fn().mockResolvedValue({ messageId: 'ok' });
++    emailService.setTransporter({ sendMail });
++    await request(app).put('/api/reminders/settings').set(auth(u.token)).send({ emailEnabled: true });
++
++    const res = await request(app).post('/api/reminders/test').set(auth(u.token));
++    expect(res.status).toBe(200);
++    expect(res.body).toMatchObject({ inApp: true, emailStatus: 'sent' });
++    expect(sendMail).toHaveBeenCalledTimes(1);
++    expect(sendMail.mock.calls[0][0]).toMatchObject({ to: u.email, subject: 'Test reminder' });
++    expect(sendMail.mock.calls[0][0].from).toContain('no-reply');
++  });
++
++  test('a failing e-mail transport is reported as failed, not as a server error', async () => {
++    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++    const u = await newUser();
++    emailService.setTransporter({ sendMail: jest.fn().mockRejectedValue(new Error('auth failed')) });
++    await request(app).put('/api/reminders/settings').set(auth(u.token)).send({ emailEnabled: true });
++    const res = await request(app).post('/api/reminders/test').set(auth(u.token));
++    expect(res.status).toBe(200);
++    expect(res.body.emailStatus).toBe('failed');
++    errSpy.mockRestore();
++  });
++
++  test('with both channels off the test is refused with a helpful message', async () => {
++    const u = await newUser();
++    await request(app).put('/api/reminders/settings').set(auth(u.token)).send({ pushEnabled: false, emailEnabled: false });
++    const res = await request(app).post('/api/reminders/test').set(auth(u.token));
++    expect(res.status).toBe(400);
++    expect(res.body.message).toMatch(/Turn on/);
++  });
++
++  test('without SMTP settings sendEmail works in dev mode (nothing leaves the machine)', async () => {
++    const info = await emailService.sendEmail({ to: 'a@b.com', subject: 'Hello', text: 'Body' });
++    const sent = JSON.parse(info.message);
++    expect(sent.subject).toBe('Hello');
++    expect(sent.to[0].address).toBe('a@b.com');
++  });
++});
+diff --git a/backend/tests/r20.audit.test.js b/backend/tests/r20.audit.test.js
+new file mode 100644
+index 0000000..dda27c1
+--- /dev/null
++++ b/backend/tests/r20.audit.test.js
+@@ -0,0 +1,292 @@
++/**
++ * R20 - Audit Log / Activity History tests
++ * Needs a local MongoDB (uses the separate finance_tracker_test database).
++ */
++process.env.JWT_SECRET = 'test_secret';
++process.env.NODE_ENV = 'test';
++const mongoose = require('mongoose');
++const request = require('supertest');
++const app = require('../app');
++const AuditLog = require('../models/AuditLog');
++
++const TEST_URI = process.env.TEST_MONGO_URI || 'mongodb://127.0.0.1:27017/finance_tracker_test';
++const auth = (token) => ({ Authorization: `Bearer ${token}` });
++let counter = 0;
++
++const newUser = async () => {
++  counter += 1;
++  const email = `audit${counter}@test.com`;
++  const res = await request(app)
++    .post('/api/auth/register')
++    .send({ name: `Audit User ${counter}`, email, password: 'secret123' });
++  expect(res.status).toBe(201);
++  return { token: res.body.token, id: res.body._id, email };
++};
++
++// audit rows are written right after the response is sent -> wait until `count` rows exist
++const waitForLogs = async (userId, count = 1) => {
++  for (let i = 0; i < 40; i++) {
++    const n = await AuditLog.countDocuments({ user: userId });
++    if (n >= count) return;
++    await new Promise((r) => setTimeout(r, 25));
++  }
++  throw new Error(`expected ${count} audit rows`);
++};
++
++const getLogs = async (token, query = '') => {
++  const res = await request(app).get(`/api/audit${query}`).set(auth(token));
++  expect(res.status).toBe(200);
++  return res.body;
++};
++
++beforeAll(async () => {
++  await mongoose.connect(TEST_URI);
++  await mongoose.connection.dropDatabase();
++  await AuditLog.init();
++});
++
++afterAll(async () => {
++  await mongoose.connection.dropDatabase();
++  await mongoose.disconnect();
++});
++
++describe('R20 - activity is recorded', () => {
++  test('login is recorded', async () => {
++    const u = await newUser();
++    await request(app).post('/api/auth/login').send({ email: u.email, password: 'secret123' });
++    await waitForLogs(u.id, 1);
++    const { logs } = await getLogs(u.token);
++    expect(logs[0]).toMatchObject({ action: 'LOGIN', entityType: 'Auth', description: 'Logged in' });
++  });
++
++  test('wrong password login is NOT recorded', async () => {
++    const u = await newUser();
++    await request(app).post('/api/auth/login').send({ email: u.email, password: 'wrong-pass' });
++    await new Promise((r) => setTimeout(r, 150));
++    expect(await AuditLog.countDocuments({ user: u.id })).toBe(0);
++  });
++
++  test('account create / update / delete are recorded with action, entity, id and name', async () => {
++    const u = await newUser();
++    const created = await request(app)
++      .post('/api/accounts')
++      .set(auth(u.token))
++      .send({ name: 'Brac Bank', accountType: 'Bank', balance: 98765 });
++    expect(created.status).toBe(201);
++    const accId = created.body._id;
++
++    const updated = await request(app)
++      .put(`/api/accounts/${accId}`)
++      .set(auth(u.token))
++      .send({ name: 'Brac Bank Main', balance: 11111 });
++    expect(updated.status).toBe(200);
++
++    const deleted = await request(app).delete(`/api/accounts/${accId}`).set(auth(u.token));
++    expect(deleted.status).toBe(200);
++
++    await waitForLogs(u.id, 3);
++    const { logs, total } = await getLogs(u.token);
++    expect(total).toBe(3);
++
++    // newest first: DELETE, UPDATE, CREATE
++    expect(logs.map((l) => l.action)).toEqual(['DELETE', 'UPDATE', 'CREATE']);
++    logs.forEach((l) => {
++      expect(l.entityType).toBe('Account');
++      expect(l.entityId).toBe(accId);
++    });
++    expect(logs[2].description).toBe('Created account "Brac Bank"');
++    expect(logs[1].description).toBe('Updated account "Brac Bank Main"');
++    expect(logs[1].changedFields).toEqual(['name', 'balance']);
++    expect(logs[0].description).toBe('Deleted account "Brac Bank Main"');
++  });
++
++  test('values (balance amounts) are never stored in the log', async () => {
++    const u = await newUser();
++    await request(app)
++      .post('/api/accounts')
++      .set(auth(u.token))
++      .send({ name: 'Secret', accountType: 'Cash', balance: 424242 });
++    await waitForLogs(u.id, 1);
++    const raw = JSON.stringify(await AuditLog.find({ user: u.id }).lean());
++    expect(raw).not.toContain('424242');
++  });
++
++  test('failed requests (validation error / not found) are not recorded', async () => {
++    const u = await newUser();
++    const bad = await request(app).post('/api/accounts').set(auth(u.token)).send({ accountType: 'Cash' });
++    expect(bad.status).toBe(400);
++    const missing = await request(app)
++      .delete('/api/accounts/64b7f0f0f0f0f0f0f0f0f0f0')
++      .set(auth(u.token));
++    expect(missing.status).toBe(404);
++    await new Promise((r) => setTimeout(r, 150));
++    expect(await AuditLog.countDocuments({ user: u.id })).toBe(0);
++  });
++
++  test('profile update logs field names only', async () => {
++    const u = await newUser();
++    await request(app)
++      .put('/api/users/profile')
++      .set(auth(u.token))
++      .send({ name: 'Brand New Name', password: 'newsecret999' });
++    await waitForLogs(u.id, 1);
++    const { logs } = await getLogs(u.token);
++    expect(logs[0]).toMatchObject({ action: 'UPDATE', entityType: 'Profile' });
++    expect(logs[0].changedFields).toEqual(['name', 'password']);
++    const raw = JSON.stringify(await AuditLog.find({ user: u.id }).lean());
++    expect(raw).not.toContain('newsecret999');
++    expect(raw).not.toContain('Brand New Name');
++  });
++
++  test('PIN create / change / remove are recorded without the digits', async () => {
++    const u = await newUser();
++    await request(app).post('/api/users/pin').set(auth(u.token)).send({ pin: '7391' });
++    await request(app).post('/api/users/pin').set(auth(u.token)).send({ pin: '8246', currentPin: '7391' });
++    await request(app).delete('/api/users/pin').set(auth(u.token)).send({ pin: '8246' });
++    await waitForLogs(u.id, 3);
++
++    const { logs } = await getLogs(u.token);
++    expect(logs.map((l) => l.description)).toEqual([
++      'Removed security PIN',
++      'Changed security PIN',
++      'Created security PIN',
++    ]);
++    logs.forEach((l) => expect(l.entityType).toBe('Security'));
++    const raw = JSON.stringify(await AuditLog.find({ user: u.id }).lean());
++    ['7391', '8246'].forEach((pin) => expect(raw).not.toContain(pin));
++  });
++
++  test('a failing audit write never breaks the real request', async () => {
++    const u = await newUser();
++    const spy = jest.spyOn(AuditLog, 'create').mockRejectedValue(new Error('db down'));
++    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
++    const res = await request(app)
++      .post('/api/accounts')
++      .set(auth(u.token))
++      .send({ name: 'Still works', accountType: 'Cash' });
++    expect(res.status).toBe(201);
++    await new Promise((r) => setTimeout(r, 100));
++    spy.mockRestore();
++    errSpy.mockRestore();
++  });
++});
++
++describe('R20 - viewing the history', () => {
++  let a;
++  let b;
++
++  beforeAll(async () => {
++    a = await newUser();
++    b = await newUser();
++    // user A: 3 accounts created + 1 deleted + 1 profile update = 5 rows (+ nothing else)
++    const ids = [];
++    for (const name of ['Cash Wallet', 'bKash Personal', 'City Bank']) {
++      const r = await request(app)
++        .post('/api/accounts')
++        .set(auth(a.token))
++        .send({ name, accountType: 'Cash' });
++      ids.push(r.body._id);
++    }
++    await request(app).delete(`/api/accounts/${ids[0]}`).set(auth(a.token));
++    await request(app).put('/api/users/profile').set(auth(a.token)).send({ name: 'Alice' });
++    await waitForLogs(a.id, 5);
++    // user B: 1 row
++    await request(app).post('/api/accounts').set(auth(b.token)).send({ name: 'B only', accountType: 'Cash' });
++    await waitForLogs(b.id, 1);
++  });
++
++  test('requires login', async () => {
++    const res = await request(app).get('/api/audit');
++    expect(res.status).toBe(401);
++  });
++
++  test('users only see their own history', async () => {
++    const bLogs = await getLogs(b.token);
++    expect(bLogs.total).toBe(1);
++    expect(bLogs.logs[0].description).toContain('B only');
++    const aLogs = await getLogs(a.token);
++    expect(aLogs.total).toBe(5);
++    expect(JSON.stringify(aLogs)).not.toContain('B only');
++  });
++
++  test('pagination', async () => {
++    const p1 = await getLogs(a.token, '?limit=2&page=1');
++    expect(p1).toMatchObject({ page: 1, limit: 2, total: 5, pages: 3 });
++    expect(p1.logs).toHaveLength(2);
++    const p3 = await getLogs(a.token, '?limit=2&page=3');
++    expect(p3.logs).toHaveLength(1);
++    const ids = new Set([...p1.logs, ...(await getLogs(a.token, '?limit=2&page=2')).logs, ...p3.logs].map((l) => l._id));
++    expect(ids.size).toBe(5); // no row repeated or skipped
++  });
++
++  test('filter by action', async () => {
++    const r = await getLogs(a.token, '?action=DELETE');
++    expect(r.total).toBe(1);
++    expect(r.logs[0].action).toBe('DELETE');
++  });
++
++  test('filter by entityType', async () => {
++    const acc = await getLogs(a.token, '?entityType=Account');
++    expect(acc.total).toBe(4);
++    const prof = await getLogs(a.token, '?entityType=Profile');
++    expect(prof.total).toBe(1);
++  });
++
++  test('search in the description (case-insensitive, special characters are safe)', async () => {
++    const r = await getLogs(a.token, '?search=bkash');
++    expect(r.total).toBe(1);
++    expect(r.logs[0].description).toContain('bKash Personal');
++    const weird = await getLogs(a.token, `?search=${encodeURIComponent('.*(')}`);
++    expect(weird.total).toBe(0);
++  });
++
++  test('filter by date range (whole "to" day is included)', async () => {
++    const today = new Date().toISOString().slice(0, 10);
++    const inRange = await getLogs(a.token, `?from=${today}&to=${today}`);
++    expect(inRange.total).toBe(5);
++    const past = await getLogs(a.token, '?from=2020-01-01&to=2020-01-31');
++    expect(past.total).toBe(0);
++  });
++
++  test.each([
++    '?action=EXPLODE',
++    '?entityType=Nonsense',
++    '?from=yesterday',
++    '?to=2026-13-45',
++  ])('invalid filter %s is a 400', async (q) => {
++    const res = await request(app).get(`/api/audit${q}`).set(auth(a.token));
++    expect(res.status).toBe(400);
++  });
++
++  test('limit is capped at 100 and bad paging values fall back to defaults', async () => {
++    const r = await getLogs(a.token, '?limit=100000&page=-4');
++    expect(r.limit).toBe(100);
++    expect(r.page).toBe(1);
++  });
++});
++
++describe('R20 - the history cannot be tampered with', () => {
++  test('no edit / delete endpoints exist', async () => {
++    const u = await newUser();
++    const post = await request(app).post('/api/audit').set(auth(u.token)).send({ action: 'CREATE' });
++    const del = await request(app).delete('/api/audit/123').set(auth(u.token));
++    const put = await request(app).put('/api/audit/123').set(auth(u.token)).send({});
++    [post, del, put].forEach((r) => expect(r.status).toBe(404));
++  });
++
++  test('the model itself refuses updates and deletes', async () => {
++    const u = await newUser();
++    const row = await AuditLog.create({
++      user: u.id,
++      action: 'CREATE',
++      entityType: 'Account',
++      description: 'Created account "X"',
++    });
++    await expect(AuditLog.updateOne({ _id: row._id }, { description: 'edited' })).rejects.toThrow(/read-only/);
++    await expect(AuditLog.deleteOne({ _id: row._id })).rejects.toThrow(/read-only/);
++    await expect(AuditLog.deleteMany({ user: u.id })).rejects.toThrow(/read-only/);
++    await expect(AuditLog.findOneAndUpdate({ _id: row._id }, { action: 'DELETE' })).rejects.toThrow(/read-only/);
++    const still = await AuditLog.findById(row._id);
++    expect(still.description).toBe('Created account "X"');
++  });
++});
+diff --git a/frontend/src/App.jsx b/frontend/src/App.jsx
+index 3528826..9b28e98 100644
+--- a/frontend/src/App.jsx
++++ b/frontend/src/App.jsx
+@@ -9,6 +9,8 @@ import PinLock from './components/common/PinLock';
+ import Profile from './pages/Profile';
+ import Accounts from './pages/Accounts';
+ import Login from './pages/Login';
++import Reminders from './pages/Reminders';
++import AuditLog from './pages/AuditLog';
+ 
+ export default function App() {
+   return (
+@@ -39,6 +41,22 @@ export default function App() {
+                     </ProtectedRoute>
+                   }
+                 />
++                <Route
++                  path="/reminders"
++                  element={
++                    <ProtectedRoute>
++                      <Reminders />
++                    </ProtectedRoute>
++                  }
++                />
++                <Route
++                  path="/activity"
++                  element={
++                    <ProtectedRoute>
++                      <AuditLog />
++                    </ProtectedRoute>
++                  }
++                />
+                 <Route path="/" element={<Navigate to="/accounts" replace />} />
+               </Routes>
+             </main>
+diff --git a/frontend/src/api/auditApi.js b/frontend/src/api/auditApi.js
+index e69de29..8a0449f 100644
+--- a/frontend/src/api/auditApi.js
++++ b/frontend/src/api/auditApi.js
+@@ -0,0 +1,9 @@
++import API from './axiosInstance';
++
++// R20: activity history. params: { action, entityType, from, to, search, page, limit }
++export const getAuditLogs = async (params = {}) => {
++  // drop empty filters so they are not sent as "?action="
++  const clean = Object.fromEntries(Object.entries(params).filter(([, v]) => v !== '' && v != null));
++  const { data } = await API.get('/audit', { params: clean });
++  return data; // { logs, page, limit, total, pages }
++};
+diff --git a/frontend/src/api/reminderApi.js b/frontend/src/api/reminderApi.js
+new file mode 100644
+index 0000000..c7ae010
+--- /dev/null
++++ b/frontend/src/api/reminderApi.js
+@@ -0,0 +1,19 @@
++import API from './axiosInstance';
++
++// ---- R19: notification settings
++export const getReminderSettings = async () => (await API.get('/reminders/settings')).data;
++export const updateReminderSettings = async (payload) => (await API.put('/reminders/settings', payload)).data;
++export const sendTestReminder = async () => (await API.post('/reminders/test')).data;
++
++// ---- R19: bill reminders
++export const getBills = async () => (await API.get('/reminders')).data;
++export const createBill = async (payload) => (await API.post('/reminders', payload)).data;
++export const updateBill = async (id, payload) => (await API.put(`/reminders/${id}`, payload)).data;
++export const deleteBill = async (id) => (await API.delete(`/reminders/${id}`)).data;
++export const markBillPaid = async (id) => (await API.post(`/reminders/${id}/paid`)).data;
++
++// ---- R19: in-app notifications (the bell)
++export const getNotifications = async (limit = 20) =>
++  (await API.get('/notifications', { params: { limit } })).data; // { notifications, unreadCount }
++export const markNotificationRead = async (id) => (await API.put(`/notifications/${id}/read`)).data;
++export const markAllNotificationsRead = async () => (await API.put('/notifications/read-all')).data;
+diff --git a/frontend/src/components/common/Navbar.jsx b/frontend/src/components/common/Navbar.jsx
+index 4777f91..d63b1d1 100644
+--- a/frontend/src/components/common/Navbar.jsx
++++ b/frontend/src/components/common/Navbar.jsx
+@@ -3,7 +3,8 @@ import { Link, useNavigate, useLocation } from 'react-router-dom';
+ import { useAuth } from '../../context/AuthContext';
+ import { useTheme } from '../../context/ThemeContext';
+ import { usePrivacy } from '../../context/PrivacyContext';
+-import { User, LogOut, CreditCard, Sun, Moon, Activity, Eye, EyeOff, Lock } from 'lucide-react';
++import NotificationBell from './NotificationBell';
++import { User, LogOut, CreditCard, Sun, Moon, Activity, Eye, EyeOff, Lock, BellRing, History } from 'lucide-react';
+ 
+ export default function Navbar() {
+   const { user, logoutUser } = useAuth();
+@@ -77,6 +78,30 @@ export default function Navbar() {
+                   <User className="w-3.5 h-3.5 text-emerald-500" />
+                   Profile
+                 </Link>
++
++                <Link
++                  to="/reminders"
++                  className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
++                    isActive('/reminders')
++                      ? 'bg-white dark:bg-slate-700 text-emerald-600 dark:text-emerald-400 shadow-sm border border-slate-200/50 dark:border-slate-600/50'
++                      : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-white/50 dark:hover:bg-slate-700/50'
++                  }`}
++                >
++                  <BellRing className="w-3.5 h-3.5 text-emerald-500" />
++                  Reminders
++                </Link>
++
++                <Link
++                  to="/activity"
++                  className={`inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-semibold transition-all ${
++                    isActive('/activity')
++                      ? 'bg-white dark:bg-slate-700 text-emerald-600 dark:text-emerald-400 shadow-sm border border-slate-200/50 dark:border-slate-600/50'
++                      : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-white/50 dark:hover:bg-slate-700/50'
++                  }`}
++                >
++                  <History className="w-3.5 h-3.5 text-emerald-500" />
++                  Activity
++                </Link>
+               </div>
+             )}
+           </div>
+@@ -92,6 +117,9 @@ export default function Navbar() {
+               {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4 text-slate-700" />}
+             </button>
+ 
++            {/* R19: reminders bell */}
++            {user && <NotificationBell />}
++
+             {/* R3: show / hide balances */}
+             {user && (
+               <button
+diff --git a/frontend/src/components/common/NotificationBell.jsx b/frontend/src/components/common/NotificationBell.jsx
+new file mode 100644
+index 0000000..d1401a7
+--- /dev/null
++++ b/frontend/src/components/common/NotificationBell.jsx
+@@ -0,0 +1,154 @@
++import React, { useState, useEffect, useRef, useCallback } from 'react';
++import { Bell, CheckCheck, CalendarClock, PencilLine, FlaskConical } from 'lucide-react';
++import { getNotifications, markNotificationRead, markAllNotificationsRead } from '../../api/reminderApi';
++
++const POLL_MS = 60 * 1000; // look for new reminders every minute
++
++const iconFor = (type) => {
++  if (type === 'bill_due') return <CalendarClock className="w-4 h-4 text-amber-500" />;
++  if (type === 'daily_log') return <PencilLine className="w-4 h-4 text-emerald-500" />;
++  return <FlaskConical className="w-4 h-4 text-sky-500" />;
++};
++
++const timeAgo = (iso) => {
++  const mins = Math.floor((Date.now() - new Date(iso).getTime()) / 60000);
++  if (mins < 1) return 'just now';
++  if (mins < 60) return `${mins} min ago`;
++  const hrs = Math.floor(mins / 60);
++  if (hrs < 24) return `${hrs} hr ago`;
++  return new Date(iso).toLocaleDateString();
++};
++
++// R19: bell in the navbar. Shows unread reminders and (if the user allowed it)
++// pops a browser notification when a NEW reminder arrives.
++export default function NotificationBell() {
++  const [items, setItems] = useState([]);
++  const [unread, setUnread] = useState(0);
++  const [open, setOpen] = useState(false);
++  const seen = useRef(null); // ids we already know (so only NEW ones trigger a pop-up)
++  const box = useRef(null);
++
++  const load = useCallback(async () => {
++    try {
++      const data = await getNotifications(15);
++      setItems(data.notifications);
++      setUnread(data.unreadCount);
++
++      if (seen.current === null) {
++        // first load: remember everything, do not pop up old reminders
++        seen.current = new Set(data.notifications.map((n) => n._id));
++        return;
++      }
++      data.notifications
++        .filter((n) => !n.isRead && !seen.current.has(n._id))
++        .forEach((n) => {
++          seen.current.add(n._id);
++          if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
++            new Notification(n.title, { body: n.message });
++          }
++        });
++    } catch (e) {
++      /* bell is optional - ignore network errors, try again next minute */
++    }
++  }, []);
++
++  useEffect(() => {
++    load();
++    const timer = setInterval(load, POLL_MS);
++    return () => clearInterval(timer);
++  }, [load]);
++
++  // close when clicking outside
++  useEffect(() => {
++    const onClick = (e) => {
++      if (box.current && !box.current.contains(e.target)) setOpen(false);
++    };
++    document.addEventListener('mousedown', onClick);
++    return () => document.removeEventListener('mousedown', onClick);
++  }, []);
++
++  const readOne = async (n) => {
++    if (n.isRead) return;
++    setItems((prev) => prev.map((x) => (x._id === n._id ? { ...x, isRead: true } : x)));
++    setUnread((c) => Math.max(c - 1, 0));
++    try {
++      await markNotificationRead(n._id);
++    } catch (e) {
++      load();
++    }
++  };
++
++  const readAll = async () => {
++    setItems((prev) => prev.map((x) => ({ ...x, isRead: true })));
++    setUnread(0);
++    try {
++      await markAllNotificationsRead();
++    } catch (e) {
++      load();
++    }
++  };
++
++  return (
++    <div className="relative" ref={box}>
++      <button
++        onClick={() => {
++          setOpen((o) => !o);
++          if (!open) load();
++        }}
++        className="relative p-2 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-700 transition-all border border-slate-200 dark:border-slate-700"
++        title="Reminders"
++        aria-label={`Notifications${unread ? `, ${unread} unread` : ''}`}
++      >
++        <Bell className="w-4 h-4" />
++        {unread > 0 && (
++          <span
++            data-testid="unread-badge"
++            className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-rose-500 text-white text-[10px] font-bold flex items-center justify-center"
++          >
++            {unread > 9 ? '9+' : unread}
++          </span>
++        )}
++      </button>
++
++      {open && (
++        <div className="absolute right-0 mt-2 w-80 max-w-[90vw] bg-white dark:bg-[#121826] border border-slate-200 dark:border-slate-700 rounded-2xl shadow-2xl z-50 overflow-hidden">
++          <div className="flex items-center justify-between px-4 py-3 border-b border-slate-100 dark:border-slate-800">
++            <span className="text-sm font-bold text-slate-900 dark:text-white">Reminders</span>
++            {unread > 0 && (
++              <button onClick={readAll} className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-600 dark:text-emerald-400 hover:underline">
++                <CheckCheck className="w-3.5 h-3.5" />
++                Mark all read
++              </button>
++            )}
++          </div>
++
++          <div className="max-h-80 overflow-y-auto">
++            {items.length === 0 ? (
++              <p className="px-4 py-8 text-center text-xs text-slate-500 dark:text-slate-400">
++                No reminders yet.
++              </p>
++            ) : (
++              items.map((n) => (
++                <button
++                  key={n._id}
++                  onClick={() => readOne(n)}
++                  className={`w-full text-left flex gap-3 px-4 py-3 border-b border-slate-50 dark:border-slate-800/60 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors ${
++                    n.isRead ? 'opacity-60' : 'bg-emerald-50/40 dark:bg-emerald-950/10'
++                  }`}
++                >
++                  <span className="mt-0.5">{iconFor(n.type)}</span>
++                  <span className="flex-1 min-w-0">
++                    <span className="block text-xs font-bold text-slate-900 dark:text-white">{n.title}</span>
++                    <span className="block text-xs text-slate-600 dark:text-slate-300 mt-0.5">{n.message}</span>
++                    <span className="block text-[10px] text-slate-400 mt-1">{timeAgo(n.createdAt)}</span>
++                  </span>
++                  {!n.isRead && <span className="mt-1.5 w-2 h-2 rounded-full bg-emerald-500 flex-shrink-0" />}
++                </button>
++              ))
++            )}
++          </div>
++        </div>
++      )}
++    </div>
++  );
++}
+diff --git a/frontend/src/pages/AuditLog.jsx b/frontend/src/pages/AuditLog.jsx
+index e69de29..be0aa71 100644
+--- a/frontend/src/pages/AuditLog.jsx
++++ b/frontend/src/pages/AuditLog.jsx
+@@ -0,0 +1,199 @@
++import React, { useState, useEffect, useCallback } from 'react';
++import { History, Search, ChevronLeft, ChevronRight, Loader2, AlertCircle, FilterX, Plus, Pencil, Trash2, LogIn } from 'lucide-react';
++import { getAuditLogs } from '../api/auditApi';
++
++const ACTIONS = ['CREATE', 'UPDATE', 'DELETE', 'LOGIN'];
++const ENTITIES = ['Account', 'Transaction', 'Category', 'Budget', 'Goal', 'Debt', 'SplitBill', 'Reminder', 'Profile', 'Security', 'Auth'];
++const PAGE_SIZE = 15;
++
++const ACTION_STYLE = {
++  CREATE: { cls: 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-800/60', Icon: Plus },
++  UPDATE: { cls: 'bg-sky-50 dark:bg-sky-950/50 text-sky-700 dark:text-sky-400 border-sky-200 dark:border-sky-800/60', Icon: Pencil },
++  DELETE: { cls: 'bg-rose-50 dark:bg-rose-950/50 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-800/60', Icon: Trash2 },
++  LOGIN: { cls: 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700', Icon: LogIn },
++};
++
++const inputCls =
++  'w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/40';
++
++const emptyFilters = { search: '', action: '', entityType: '', from: '', to: '' };
++
++// R20: read-only activity history
++export default function AuditLog() {
++  const [filters, setFilters] = useState(emptyFilters);
++  const [debouncedSearch, setDebouncedSearch] = useState('');
++  const [page, setPage] = useState(1);
++  const [data, setData] = useState({ logs: [], total: 0, pages: 1 });
++  const [loading, setLoading] = useState(true);
++  const [error, setError] = useState('');
++
++  // wait until the user stops typing before searching
++  useEffect(() => {
++    const t = setTimeout(() => setDebouncedSearch(filters.search), 400);
++    return () => clearTimeout(t);
++  }, [filters.search]);
++
++  const load = useCallback(async () => {
++    setLoading(true);
++    setError('');
++    try {
++      const result = await getAuditLogs({
++        search: debouncedSearch,
++        action: filters.action,
++        entityType: filters.entityType,
++        from: filters.from,
++        to: filters.to,
++        page,
++        limit: PAGE_SIZE,
++      });
++      setData(result);
++    } catch (err) {
++      setError(err.response?.data?.message || 'Could not load the activity history.');
++    } finally {
++      setLoading(false);
++    }
++  }, [debouncedSearch, filters.action, filters.entityType, filters.from, filters.to, page]);
++
++  useEffect(() => {
++    load();
++  }, [load]);
++
++  const change = (key) => (e) => {
++    setFilters((f) => ({ ...f, [key]: e.target.value }));
++    if (key !== 'search') setPage(1);
++  };
++
++  // typing a new search goes back to page 1 too
++  useEffect(() => {
++    setPage(1);
++  }, [debouncedSearch]);
++
++  const hasFilters = Object.values(filters).some(Boolean);
++
++  return (
++    <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
++      <div className="flex items-center gap-3">
++        <div className="p-2.5 rounded-2xl bg-emerald-500/10 border border-emerald-500/20">
++          <History className="w-6 h-6 text-emerald-500" />
++        </div>
++        <div>
++          <h1 className="text-2xl font-extrabold text-slate-900 dark:text-white">Activity History</h1>
++          <p className="text-xs text-slate-500 dark:text-slate-400">
++            Everything you created, changed or deleted. This log is read-only.
++          </p>
++        </div>
++      </div>
++
++      {/* filters */}
++      <div className="bg-white dark:bg-[#121826] p-4 rounded-3xl border border-slate-200/70 dark:border-slate-800/80 shadow-sm">
++        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
++          <div className="relative lg:col-span-2">
++            <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
++            <input
++              aria-label="Search activity"
++              placeholder="Search description..."
++              value={filters.search}
++              onChange={change('search')}
++              className={`${inputCls} pl-9`}
++            />
++          </div>
++          <select aria-label="Filter by action" value={filters.action} onChange={change('action')} className={inputCls}>
++            <option value="">All actions</option>
++            {ACTIONS.map((a) => (
++              <option key={a} value={a}>{a}</option>
++            ))}
++          </select>
++          <select aria-label="Filter by type" value={filters.entityType} onChange={change('entityType')} className={inputCls}>
++            <option value="">All types</option>
++            {ENTITIES.map((e) => (
++              <option key={e} value={e}>{e}</option>
++            ))}
++          </select>
++          <input aria-label="From date" type="date" value={filters.from} onChange={change('from')} className={inputCls} />
++          <input aria-label="To date" type="date" value={filters.to} onChange={change('to')} className={inputCls} />
++        </div>
++        {hasFilters && (
++          <button
++            onClick={() => {
++              setFilters(emptyFilters);
++              setPage(1);
++            }}
++            className="mt-3 inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-600 dark:text-emerald-400 hover:underline"
++          >
++            <FilterX className="w-3.5 h-3.5" />
++            Clear filters
++          </button>
++        )}
++      </div>
++
++      {error && (
++        <div className="p-3 rounded-xl flex items-center gap-2.5 text-xs font-medium bg-rose-50 dark:bg-rose-950/40 text-rose-800 dark:text-rose-300 border border-rose-200 dark:border-rose-800/60">
++          <AlertCircle className="w-4 h-4" />
++          {error}
++        </div>
++      )}
++
++      {/* list */}
++      <div className="bg-white dark:bg-[#121826] rounded-3xl border border-slate-200/70 dark:border-slate-800/80 shadow-sm overflow-hidden">
++        {loading ? (
++          <div className="flex items-center justify-center py-16">
++            <Loader2 className="w-6 h-6 text-emerald-500 animate-spin" />
++          </div>
++        ) : data.logs.length === 0 ? (
++          <p className="py-16 text-center text-sm text-slate-500 dark:text-slate-400">
++            {hasFilters ? 'No activity matches these filters.' : 'No activity yet. Create an account and it will appear here.'}
++          </p>
++        ) : (
++          <ul className="divide-y divide-slate-100 dark:divide-slate-800">
++            {data.logs.map((log) => {
++              const { cls, Icon } = ACTION_STYLE[log.action] || ACTION_STYLE.LOGIN;
++              const when = new Date(log.timestamp);
++              return (
++                <li key={log._id} className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 px-5 py-3.5">
++                  <span className={`inline-flex items-center gap-1.5 w-24 justify-center px-2.5 py-1 rounded-lg text-[11px] font-bold border ${cls}`}>
++                    <Icon className="w-3 h-3" />
++                    {log.action}
++                  </span>
++                  <div className="flex-1 min-w-0">
++                    <p className="text-sm font-semibold text-slate-900 dark:text-white truncate">{log.description}</p>
++                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
++                      {log.entityType}
++                      {log.changedFields?.length > 0 && ` · changed: ${log.changedFields.join(', ')}`}
++                    </p>
++                  </div>
++                  <time dateTime={log.timestamp} className="text-xs text-slate-500 dark:text-slate-400 sm:text-right whitespace-nowrap">
++                    {when.toLocaleDateString()} {when.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
++                  </time>
++                </li>
++              );
++            })}
++          </ul>
++        )}
++      </div>
++
++      {/* pagination */}
++      <div className="flex items-center justify-between text-xs text-slate-500 dark:text-slate-400">
++        <span>{data.total} {data.total === 1 ? 'entry' : 'entries'}</span>
++        <div className="flex items-center gap-2">
++          <button
++            onClick={() => setPage((p) => Math.max(p - 1, 1))}
++            disabled={page <= 1 || loading}
++            aria-label="Previous page"
++            className="p-2 rounded-lg border border-slate-200 dark:border-slate-700 disabled:opacity-40 hover:bg-slate-100 dark:hover:bg-slate-800"
++          >
++            <ChevronLeft className="w-4 h-4" />
++          </button>
++          <span>Page {data.page || page} of {data.pages}</span>
++          <button
++            onClick={() => setPage((p) => Math.min(p + 1, data.pages))}
++            disabled={page >= data.pages || loading}
++            aria-label="Next page"
++            className="p-2 rounded-lg border border-slate-200 dark:border-slate-700 disabled:opacity-40 hover:bg-slate-100 dark:hover:bg-slate-800"
++          >
++            <ChevronRight className="w-4 h-4" />
++          </button>
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/frontend/src/pages/Reminders.jsx b/frontend/src/pages/Reminders.jsx
+new file mode 100644
+index 0000000..283a485
+--- /dev/null
++++ b/frontend/src/pages/Reminders.jsx
+@@ -0,0 +1,332 @@
++import React, { useState, useEffect, useCallback } from 'react';
++import { BellRing, Mail, Smartphone, CalendarClock, PencilLine, Send, Loader2, CheckCircle2, AlertCircle, Trash2, Check, Pause, Play, Plus } from 'lucide-react';
++import { useAuth } from '../context/AuthContext';
++import {
++  getReminderSettings,
++  updateReminderSettings,
++  sendTestReminder,
++  getBills,
++  createBill,
++  updateBill,
++  deleteBill,
++  markBillPaid,
++} from '../api/reminderApi';
++
++const cardCls =
++  'bg-white dark:bg-[#121826] p-6 sm:p-8 rounded-3xl border border-slate-200/70 dark:border-slate-800/80 shadow-sm space-y-5';
++const inputCls =
++  'w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-sm text-slate-800 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-emerald-500/40';
++const primaryBtn =
++  'inline-flex items-center gap-2 px-5 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-500 hover:from-emerald-400 hover:to-teal-400 text-slate-950 font-extrabold rounded-xl text-xs tracking-wider uppercase disabled:opacity-40 transition-all';
++const ghostBtn =
++  'inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-bold border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-40 transition-all';
++
++const Toggle = ({ checked, onChange, label }) => (
++  <button
++    type="button"
++    role="switch"
++    aria-checked={checked}
++    aria-label={label}
++    onClick={() => onChange(!checked)}
++    className={`relative w-11 h-6 rounded-full transition-colors flex-shrink-0 ${checked ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-700'}`}
++  >
++    <span className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white transition-transform ${checked ? 'translate-x-5' : ''}`} />
++  </button>
++);
++
++const Row = ({ icon: Icon, title, hint, children }) => (
++  <div className="flex items-start justify-between gap-4 py-3 border-b border-slate-100 dark:border-slate-800 last:border-0">
++    <div className="flex gap-3">
++      <Icon className="w-5 h-5 text-emerald-500 mt-0.5 flex-shrink-0" />
++      <div>
++        <p className="text-sm font-bold text-slate-900 dark:text-white">{title}</p>
++        <p className="text-xs text-slate-500 dark:text-slate-400">{hint}</p>
++      </div>
++    </div>
++    {children}
++  </div>
++);
++
++const dueLabel = (daysLeft) => {
++  if (daysLeft < 0) return { text: `Overdue by ${-daysLeft} day(s)`, cls: 'bg-rose-50 dark:bg-rose-950/50 text-rose-700 dark:text-rose-400 border-rose-200 dark:border-rose-800/60' };
++  if (daysLeft === 0) return { text: 'Due today', cls: 'bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-800/60' };
++  return { text: `Due in ${daysLeft} day(s)`, cls: 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300 border-slate-200 dark:border-slate-700' };
++};
++
++const blankBill = { title: '', amount: '', dueDate: '', repeat: 'none' };
++
++// R19: reminder settings + bill reminders
++export default function Reminders() {
++  const { user } = useAuth();
++  const [settings, setSettings] = useState(null);
++  const [bills, setBills] = useState([]);
++  const [form, setForm] = useState(blankBill);
++  const [busy, setBusy] = useState(false);
++  const [note, setNote] = useState({ type: '', message: '' });
++
++  const say = (type, message) => setNote({ type, message });
++  const errMsg = (err, fallback) => err.response?.data?.message || fallback;
++
++  const load = useCallback(async () => {
++    try {
++      const [s, b] = await Promise.all([getReminderSettings(), getBills()]);
++      setSettings(s);
++      setBills(b);
++    } catch (err) {
++      say('error', errMsg(err, 'Could not load reminders.'));
++    }
++  }, []);
++
++  useEffect(() => {
++    load();
++  }, [load]);
++
++  const set = (key, value) => setSettings((s) => ({ ...s, [key]: value }));
++
++  // asks the browser for permission the first time in-app notifications are switched on
++  const togglePush = async (on) => {
++    set('pushEnabled', on);
++    if (on && typeof Notification !== 'undefined' && Notification.permission === 'default') {
++      try {
++        await Notification.requestPermission();
++      } catch (e) {
++        /* user can still use the bell */
++      }
++    }
++  };
++
++  const saveSettings = async () => {
++    setBusy(true);
++    try {
++      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || settings.timezone;
++      const saved = await updateReminderSettings({
++        emailEnabled: settings.emailEnabled,
++        pushEnabled: settings.pushEnabled,
++        dailyLogReminder: settings.dailyLogReminder,
++        dailyLogTime: settings.dailyLogTime,
++        billReminders: settings.billReminders,
++        billNotifyDaysBefore: Number(settings.billNotifyDaysBefore),
++        timezone,
++      });
++      setSettings(saved);
++      say('success', 'Reminder settings saved.');
++    } catch (err) {
++      say('error', errMsg(err, 'Could not save settings.'));
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  const sendTest = async () => {
++    setBusy(true);
++    try {
++      const res = await sendTestReminder();
++      const mail = res.emailStatus === 'sent' ? ' E-mail sent.' : res.emailStatus === 'failed' ? ' E-mail could not be sent (check the SMTP settings).' : '';
++      say(res.emailStatus === 'failed' ? 'error' : 'success', `Test reminder created.${mail}`);
++    } catch (err) {
++      say('error', errMsg(err, 'Could not send test.'));
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  const addBill = async (e) => {
++    e.preventDefault();
++    setBusy(true);
++    try {
++      await createBill({
++        title: form.title,
++        dueDate: form.dueDate,
++        repeat: form.repeat,
++        ...(form.amount !== '' ? { amount: Number(form.amount) } : {}),
++      });
++      setForm(blankBill);
++      say('success', 'Bill reminder added.');
++      setBills(await getBills());
++    } catch (err) {
++      say('error', errMsg(err, 'Could not add the bill.'));
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  const runBillAction = async (action, success) => {
++    try {
++      await action();
++      say('success', success);
++      setBills(await getBills());
++    } catch (err) {
++      say('error', errMsg(err, 'Something went wrong.'));
++    }
++  };
++
++  if (!settings) {
++    return (
++      <div className="flex items-center justify-center min-h-[60vh]">
++        {note.type === 'error' ? <p className="text-sm text-rose-500">{note.message}</p> : <Loader2 className="w-6 h-6 text-emerald-500 animate-spin" />}
++      </div>
++    );
++  }
++
++  return (
++    <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
++      <div className="flex items-center gap-3">
++        <div className="p-2.5 rounded-2xl bg-emerald-500/10 border border-emerald-500/20">
++          <BellRing className="w-6 h-6 text-emerald-500" />
++        </div>
++        <div>
++          <h1 className="text-2xl font-extrabold text-slate-900 dark:text-white">Reminders</h1>
++          <p className="text-xs text-slate-500 dark:text-slate-400">Automatic e-mail and in-app reminders for daily logging and bills.</p>
++        </div>
++      </div>
++
++      {note.message && (
++        <div
++          role="status"
++          className={`p-3 rounded-xl flex items-center gap-2.5 text-xs font-medium border ${
++            note.type === 'success'
++              ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800/60'
++              : 'bg-rose-50 dark:bg-rose-950/40 text-rose-800 dark:text-rose-300 border-rose-200 dark:border-rose-800/60'
++          }`}
++        >
++          {note.type === 'success' ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
++          {note.message}
++        </div>
++      )}
++
++      {/* settings */}
++      <div className={cardCls}>
++        <h2 className="text-base font-bold text-slate-900 dark:text-white">Notification settings</h2>
++
++        <Row icon={Smartphone} title="In-app & browser notifications" hint="Bell icon in the top bar, plus a browser pop-up while the app is open.">
++          <Toggle checked={settings.pushEnabled} onChange={togglePush} label="In-app notifications" />
++        </Row>
++
++        <Row icon={Mail} title="E-mail reminders" hint={`Sent to ${user?.email || 'your e-mail'}.`}>
++          <Toggle checked={settings.emailEnabled} onChange={(v) => set('emailEnabled', v)} label="E-mail reminders" />
++        </Row>
++
++        <Row icon={PencilLine} title="Daily logging reminder" hint="A nudge to record today's income and expenses.">
++          <div className="flex items-center gap-3">
++            <input
++              type="time"
++              aria-label="Daily reminder time"
++              value={settings.dailyLogTime}
++              onChange={(e) => set('dailyLogTime', e.target.value)}
++              disabled={!settings.dailyLogReminder}
++              className={`${inputCls} w-28 disabled:opacity-40`}
++            />
++            <Toggle checked={settings.dailyLogReminder} onChange={(v) => set('dailyLogReminder', v)} label="Daily logging reminder" />
++          </div>
++        </Row>
++
++        <Row icon={CalendarClock} title="Bill due reminders" hint="Notify this many days before a bill is due (and again on the due day).">
++          <div className="flex items-center gap-3">
++            <input
++              type="number"
++              min="0"
++              max="30"
++              aria-label="Days before due"
++              value={settings.billNotifyDaysBefore}
++              onChange={(e) => set('billNotifyDaysBefore', e.target.value)}
++              disabled={!settings.billReminders}
++              className={`${inputCls} w-20 disabled:opacity-40`}
++            />
++            <Toggle checked={settings.billReminders} onChange={(v) => set('billReminders', v)} label="Bill due reminders" />
++          </div>
++        </Row>
++
++        <div className="flex flex-wrap justify-end gap-3 pt-2">
++          <button type="button" onClick={sendTest} disabled={busy} className={ghostBtn}>
++            <Send className="w-4 h-4" />
++            Send test reminder
++          </button>
++          <button type="button" onClick={saveSettings} disabled={busy} className={primaryBtn}>
++            Save settings
++          </button>
++        </div>
++      </div>
++
++      {/* bills */}
++      <div className={cardCls}>
++        <h2 className="text-base font-bold text-slate-900 dark:text-white">Bill reminders</h2>
++
++        <form onSubmit={addBill} className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5 items-end">
++          <div className="lg:col-span-2">
++            <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5" htmlFor="bill-title">Bill</label>
++            <input id="bill-title" required placeholder="e.g. House rent" value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} className={inputCls} />
++          </div>
++          <div>
++            <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5" htmlFor="bill-amount">Amount</label>
++            <input id="bill-amount" type="number" min="0" placeholder="optional" value={form.amount} onChange={(e) => setForm({ ...form, amount: e.target.value })} className={inputCls} />
++          </div>
++          <div>
++            <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5" htmlFor="bill-date">Due date</label>
++            <input id="bill-date" required type="date" value={form.dueDate} onChange={(e) => setForm({ ...form, dueDate: e.target.value })} className={inputCls} />
++          </div>
++          <div>
++            <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1.5" htmlFor="bill-repeat">Repeat</label>
++            <select id="bill-repeat" value={form.repeat} onChange={(e) => setForm({ ...form, repeat: e.target.value })} className={inputCls}>
++              <option value="none">One time</option>
++              <option value="monthly">Every month</option>
++            </select>
++          </div>
++          <div className="sm:col-span-2 lg:col-span-5 flex justify-end">
++            <button type="submit" disabled={busy} className={primaryBtn}>
++              <Plus className="w-4 h-4" />
++              Add bill
++            </button>
++          </div>
++        </form>
++
++        {bills.length === 0 ? (
++          <p className="py-6 text-center text-sm text-slate-500 dark:text-slate-400">No bills yet. Add one above and you will be reminded before it is due.</p>
++        ) : (
++          <ul className="divide-y divide-slate-100 dark:divide-slate-800">
++            {bills.map((b) => {
++              const due = dueLabel(b.daysLeft);
++              return (
++                <li key={b._id} className={`py-3.5 flex flex-col sm:flex-row sm:items-center gap-3 ${b.isActive ? '' : 'opacity-50'}`}>
++                  <div className="flex-1 min-w-0">
++                    <p className="text-sm font-bold text-slate-900 dark:text-white truncate">
++                      {b.title}
++                      {b.amount > 0 && <span className="ml-2 font-medium text-slate-500">· {b.amount}</span>}
++                    </p>
++                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
++                      {b.dueDate} · {b.repeat === 'monthly' ? 'every month' : 'one time'}
++                      {!b.isActive && ' · paused'}
++                    </p>
++                  </div>
++                  {b.isActive && <span className={`px-2.5 py-1 rounded-lg text-[11px] font-bold border ${due.cls}`}>{due.text}</span>}
++                  <div className="flex items-center gap-1.5">
++                    {b.isActive && (
++                      <button onClick={() => runBillAction(() => markBillPaid(b._id), `"${b.title}" marked as paid.`)} title="Mark as paid" aria-label={`Mark ${b.title} as paid`} className="p-2 rounded-lg border border-slate-200 dark:border-slate-700 text-emerald-600 hover:bg-emerald-50 dark:hover:bg-emerald-950/30">
++                        <Check className="w-4 h-4" />
++                      </button>
++                    )}
++                    <button
++                      onClick={() => runBillAction(() => updateBill(b._id, { isActive: !b.isActive }), b.isActive ? 'Reminder paused.' : 'Reminder resumed.')}
++                      title={b.isActive ? 'Pause' : 'Resume'}
++                      aria-label={`${b.isActive ? 'Pause' : 'Resume'} ${b.title}`}
++                      className="p-2 rounded-lg border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
++                    >
++                      {b.isActive ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
++                    </button>
++                    <button
++                      onClick={() => window.confirm(`Delete "${b.title}"?`) && runBillAction(() => deleteBill(b._id), 'Bill deleted.')}
++                      title="Delete"
++                      aria-label={`Delete ${b.title}`}
++                      className="p-2 rounded-lg border border-slate-200 dark:border-slate-700 text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/30"
++                    >
++                      <Trash2 className="w-4 h-4" />
++                    </button>
++                  </div>
++                </li>
++              );
++            })}
++          </ul>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/frontend/src/tests/reminders-audit.test.jsx b/frontend/src/tests/reminders-audit.test.jsx
+new file mode 100644
+index 0000000..846c786
+--- /dev/null
++++ b/frontend/src/tests/reminders-audit.test.jsx
+@@ -0,0 +1,316 @@
++import React from 'react';
++import { render, screen, waitFor, within, act } from '@testing-library/react';
++import userEvent from '@testing-library/user-event';
++import { vi, describe, test, expect, beforeEach, afterEach } from 'vitest';
++
++vi.mock('../api/auditApi', () => ({ getAuditLogs: vi.fn() }));
++vi.mock('../api/reminderApi', () => ({
++  getReminderSettings: vi.fn(),
++  updateReminderSettings: vi.fn(),
++  sendTestReminder: vi.fn(),
++  getBills: vi.fn(),
++  createBill: vi.fn(),
++  updateBill: vi.fn(),
++  deleteBill: vi.fn(),
++  markBillPaid: vi.fn(),
++  getNotifications: vi.fn(),
++  markNotificationRead: vi.fn(),
++  markAllNotificationsRead: vi.fn(),
++}));
++
++import * as reminderApi from '../api/reminderApi';
++import { getAuditLogs } from '../api/auditApi';
++import { AuthProvider } from '../context/AuthContext';
++import NotificationBell from '../components/common/NotificationBell';
++import AuditLog from '../pages/AuditLog';
++import Reminders from '../pages/Reminders';
++
++const storeUser = () =>
++  localStorage.setItem('userInfo', JSON.stringify({ _id: 'u1', name: 'T', email: 'me@test.com', token: 'jwt', privacySettings: {} }));
++
++const note = (over = {}) => ({
++  _id: 'n1',
++  type: 'bill_due',
++  title: 'Bill due today: Rent',
++  message: '"Rent" is due today.',
++  isRead: false,
++  createdAt: new Date().toISOString(),
++  ...over,
++});
++
++beforeEach(() => {
++  localStorage.clear();
++  vi.clearAllMocks();
++});
++
++// ---------------------------------------------------------------------------
++describe('R19 notification bell', () => {
++  test('shows the unread count, lists reminders and marks one as read', async () => {
++    reminderApi.getNotifications.mockResolvedValue({
++      notifications: [note(), note({ _id: 'n2', title: 'Time to log your expenses', type: 'daily_log' })],
++      unreadCount: 2,
++    });
++    reminderApi.markNotificationRead.mockResolvedValue({});
++    render(<NotificationBell />);
++
++    expect(await screen.findByTestId('unread-badge')).toHaveTextContent('2');
++    await userEvent.click(screen.getByRole('button', { name: /notifications, 2 unread/i }));
++    expect(screen.getByText('Bill due today: Rent')).toBeInTheDocument();
++
++    await userEvent.click(screen.getByText('Bill due today: Rent'));
++    expect(reminderApi.markNotificationRead).toHaveBeenCalledWith('n1');
++    expect(screen.getByTestId('unread-badge')).toHaveTextContent('1');
++  });
++
++  test('"Mark all read" clears the badge', async () => {
++    reminderApi.getNotifications.mockResolvedValue({ notifications: [note(), note({ _id: 'n2' })], unreadCount: 2 });
++    reminderApi.markAllNotificationsRead.mockResolvedValue({});
++    render(<NotificationBell />);
++    await screen.findByTestId('unread-badge');
++    await userEvent.click(screen.getByRole('button', { name: /notifications/i }));
++    await userEvent.click(screen.getByText('Mark all read'));
++    expect(reminderApi.markAllNotificationsRead).toHaveBeenCalled();
++    await waitFor(() => expect(screen.queryByTestId('unread-badge')).not.toBeInTheDocument());
++  });
++
++  test('empty state', async () => {
++    reminderApi.getNotifications.mockResolvedValue({ notifications: [], unreadCount: 0 });
++    render(<NotificationBell />);
++    await userEvent.click(await screen.findByRole('button', { name: /notifications/i }));
++    expect(screen.getByText('No reminders yet.')).toBeInTheDocument();
++    expect(screen.queryByTestId('unread-badge')).not.toBeInTheDocument();
++  });
++
++  test('a NEW reminder triggers a browser notification, old ones do not', async () => {
++    vi.useFakeTimers({ shouldAdvanceTime: true });
++    const popup = vi.fn();
++    vi.stubGlobal('Notification', Object.assign(popup, { permission: 'granted' }));
++
++    reminderApi.getNotifications.mockResolvedValueOnce({ notifications: [note()], unreadCount: 1 });
++    render(<NotificationBell />);
++    await screen.findByTestId('unread-badge');
++    expect(popup).not.toHaveBeenCalled(); // first load = existing reminders, no pop-up
++
++    reminderApi.getNotifications.mockResolvedValue({
++      notifications: [note({ _id: 'n9', title: 'Brand new reminder' }), note()],
++      unreadCount: 2,
++    });
++    await act(async () => {
++      vi.advanceTimersByTime(60 * 1000);
++    });
++    await waitFor(() => expect(popup).toHaveBeenCalledTimes(1));
++    expect(popup).toHaveBeenCalledWith('Brand new reminder', expect.any(Object));
++
++    vi.useRealTimers();
++    vi.unstubAllGlobals();
++  });
++});
++
++// ---------------------------------------------------------------------------
++describe('R20 activity history page', () => {
++  const log = (over = {}) => ({
++    _id: 'l1',
++    action: 'CREATE',
++    entityType: 'Account',
++    description: 'Created account "Brac Bank"',
++    changedFields: [],
++    timestamp: new Date().toISOString(),
++    ...over,
++  });
++
++  test('renders the entries with action, description and changed fields', async () => {
++    getAuditLogs.mockResolvedValue({
++      logs: [log(), log({ _id: 'l2', action: 'UPDATE', description: 'Updated account "Brac Bank"', changedFields: ['name', 'balance'] })],
++      page: 1,
++      pages: 1,
++      total: 2,
++    });
++    render(<AuditLog />);
++    expect(await screen.findByText('Created account "Brac Bank"')).toBeInTheDocument();
++    expect(screen.getByText('Updated account "Brac Bank"')).toBeInTheDocument();
++    expect(screen.getByText(/changed: name, balance/)).toBeInTheDocument();
++    expect(screen.getByText('2 entries')).toBeInTheDocument();
++  });
++
++  test('filters are sent to the API and can be cleared', async () => {
++    getAuditLogs.mockResolvedValue({ logs: [log()], page: 1, pages: 1, total: 1 });
++    render(<AuditLog />);
++    await screen.findByText('Created account "Brac Bank"');
++
++    await userEvent.selectOptions(screen.getByLabelText('Filter by action'), 'DELETE');
++    await waitFor(() =>
++      expect(getAuditLogs).toHaveBeenLastCalledWith(expect.objectContaining({ action: 'DELETE', page: 1 }))
++    );
++    await userEvent.selectOptions(screen.getByLabelText('Filter by type'), 'Account');
++    await waitFor(() =>
++      expect(getAuditLogs).toHaveBeenLastCalledWith(expect.objectContaining({ action: 'DELETE', entityType: 'Account' }))
++    );
++
++    await userEvent.click(screen.getByText('Clear filters'));
++    await waitFor(() =>
++      expect(getAuditLogs).toHaveBeenLastCalledWith(expect.objectContaining({ action: '', entityType: '' }))
++    );
++  });
++
++  test('search waits for typing to stop, then asks the API', async () => {
++    getAuditLogs.mockResolvedValue({ logs: [], page: 1, pages: 1, total: 0 });
++    render(<AuditLog />);
++    await screen.findByText(/No activity yet/);
++    await userEvent.type(screen.getByLabelText('Search activity'), 'bkash');
++    await waitFor(() => expect(getAuditLogs).toHaveBeenLastCalledWith(expect.objectContaining({ search: 'bkash' })));
++    expect(getAuditLogs.mock.calls.filter(([p]) => p.search === 'b' || p.search === 'bk')).toHaveLength(0);
++  });
++
++  test('pagination buttons change the page', async () => {
++    getAuditLogs.mockResolvedValue({ logs: [log()], page: 1, pages: 3, total: 40 });
++    render(<AuditLog />);
++    await screen.findByText('Created account "Brac Bank"');
++    expect(screen.getByLabelText('Previous page')).toBeDisabled();
++
++    await userEvent.click(screen.getByLabelText('Next page'));
++    await waitFor(() => expect(getAuditLogs).toHaveBeenLastCalledWith(expect.objectContaining({ page: 2 })));
++  });
++
++  test('empty-with-filters message and error message', async () => {
++    getAuditLogs.mockResolvedValueOnce({ logs: [log()], page: 1, pages: 1, total: 1 });
++    render(<AuditLog />);
++    await screen.findByText('Created account "Brac Bank"');
++
++    getAuditLogs.mockResolvedValue({ logs: [], page: 1, pages: 1, total: 0 });
++    await userEvent.selectOptions(screen.getByLabelText('Filter by action'), 'LOGIN');
++    expect(await screen.findByText('No activity matches these filters.')).toBeInTheDocument();
++
++    getAuditLogs.mockRejectedValue({ response: { data: { message: 'action must be one of: ...' } } });
++    await userEvent.selectOptions(screen.getByLabelText('Filter by action'), 'UPDATE');
++    expect(await screen.findByText(/action must be one of/)).toBeInTheDocument();
++  });
++});
++
++// ---------------------------------------------------------------------------
++describe('R19 reminders page', () => {
++  const settings = {
++    emailEnabled: false,
++    pushEnabled: true,
++    dailyLogReminder: false,
++    dailyLogTime: '20:00',
++    billReminders: true,
++    billNotifyDaysBefore: 2,
++    timezone: 'Asia/Dhaka',
++  };
++  const bills = [
++    { _id: 'b1', title: 'House rent', amount: 15000, dueDate: '2026-11-10', repeat: 'monthly', isActive: true, daysLeft: 3 },
++    { _id: 'b2', title: 'Old bill', amount: 0, dueDate: '2026-11-01', repeat: 'none', isActive: true, daysLeft: -6 },
++  ];
++
++  const renderPage = () =>
++    render(
++      <AuthProvider>
++        <Reminders />
++      </AuthProvider>
++    );
++
++  beforeEach(() => {
++    storeUser();
++    reminderApi.getReminderSettings.mockResolvedValue(settings);
++    reminderApi.getBills.mockResolvedValue(bills);
++  });
++
++  test('shows the saved settings and the bills with due labels', async () => {
++    renderPage();
++    expect(await screen.findByText('House rent')).toBeInTheDocument();
++    expect(screen.getByText('Due in 3 day(s)')).toBeInTheDocument();
++    expect(screen.getByText('Overdue by 6 day(s)')).toBeInTheDocument();
++    expect(screen.getByRole('switch', { name: 'In-app notifications' })).toHaveAttribute('aria-checked', 'true');
++    expect(screen.getByRole('switch', { name: 'E-mail reminders' })).toHaveAttribute('aria-checked', 'false');
++    expect(screen.getByText(/me@test\.com/)).toBeInTheDocument();
++  });
++
++  test('saving sends every setting plus the browser time zone', async () => {
++    reminderApi.updateReminderSettings.mockResolvedValue({ ...settings, emailEnabled: true, dailyLogReminder: true, dailyLogTime: '07:30' });
++    renderPage();
++    await screen.findByText('House rent');
++
++    await userEvent.click(screen.getByRole('switch', { name: 'E-mail reminders' }));
++    await userEvent.click(screen.getByRole('switch', { name: 'Daily logging reminder' }));
++    const time = screen.getByLabelText('Daily reminder time');
++    await userEvent.clear(time);
++    await userEvent.type(time, '07:30');
++    await userEvent.click(screen.getByText('Save settings'));
++
++    await waitFor(() => expect(reminderApi.updateReminderSettings).toHaveBeenCalledTimes(1));
++    const payload = reminderApi.updateReminderSettings.mock.calls[0][0];
++    expect(payload).toMatchObject({
++      emailEnabled: true,
++      pushEnabled: true,
++      dailyLogReminder: true,
++      dailyLogTime: '07:30',
++      billReminders: true,
++      billNotifyDaysBefore: 2,
++    });
++    expect(typeof payload.timezone).toBe('string');
++    expect(await screen.findByText('Reminder settings saved.')).toBeInTheDocument();
++  });
++
++  test('"Send test reminder" reports success and failure', async () => {
++    reminderApi.sendTestReminder.mockResolvedValueOnce({ inApp: true, emailStatus: 'sent' });
++    renderPage();
++    await screen.findByText('House rent');
++    await userEvent.click(screen.getByText('Send test reminder'));
++    expect(await screen.findByText(/Test reminder created\. E-mail sent\./)).toBeInTheDocument();
++
++    reminderApi.sendTestReminder.mockRejectedValueOnce({ response: { data: { message: 'Turn on e-mail or in-app notifications first, then send a test.' } } });
++    await userEvent.click(screen.getByText('Send test reminder'));
++    expect(await screen.findByText(/Turn on e-mail or in-app/)).toBeInTheDocument();
++  });
++
++  test('adding a bill sends the form values and refreshes the list', async () => {
++    reminderApi.createBill.mockResolvedValue({});
++    renderPage();
++    await screen.findByText('House rent');
++
++    await userEvent.type(screen.getByLabelText('Bill'), 'Netflix');
++    await userEvent.type(screen.getByLabelText('Amount'), '800');
++    await userEvent.type(screen.getByLabelText('Due date'), '2026-12-05');
++    await userEvent.selectOptions(screen.getByLabelText('Repeat'), 'monthly');
++    await userEvent.click(screen.getByText('Add bill'));
++
++    await waitFor(() =>
++      expect(reminderApi.createBill).toHaveBeenCalledWith({ title: 'Netflix', amount: 800, dueDate: '2026-12-05', repeat: 'monthly' })
++    );
++    await waitFor(() => expect(reminderApi.getBills).toHaveBeenCalledTimes(2));
++  });
++
++  test('mark paid, pause and delete (with confirmation)', async () => {
++    reminderApi.markBillPaid.mockResolvedValue({});
++    reminderApi.updateBill.mockResolvedValue({});
++    reminderApi.deleteBill.mockResolvedValue({});
++    renderPage();
++    await screen.findByText('House rent');
++
++    await userEvent.click(screen.getByLabelText('Mark House rent as paid'));
++    expect(reminderApi.markBillPaid).toHaveBeenCalledWith('b1');
++
++    await userEvent.click(screen.getByLabelText('Pause House rent'));
++    expect(reminderApi.updateBill).toHaveBeenCalledWith('b1', { isActive: false });
++
++    const confirm = vi.spyOn(window, 'confirm');
++    confirm.mockReturnValueOnce(false);
++    await userEvent.click(screen.getByLabelText('Delete House rent'));
++    expect(reminderApi.deleteBill).not.toHaveBeenCalled(); // cancelled
++
++    confirm.mockReturnValueOnce(true);
++    await userEvent.click(screen.getByLabelText('Delete House rent'));
++    expect(reminderApi.deleteBill).toHaveBeenCalledWith('b1');
++    confirm.mockRestore();
++  });
++
++  test('server validation message is shown when adding a bill fails', async () => {
++    reminderApi.createBill.mockRejectedValue({ response: { data: { message: 'dueDate must be a real date like 2026-12-01' } } });
++    renderPage();
++    await screen.findByText('House rent');
++    await userEvent.type(screen.getByLabelText('Bill'), 'X');
++    await userEvent.type(screen.getByLabelText('Due date'), '2026-12-05');
++    await userEvent.click(screen.getByText('Add bill'));
++    expect(await screen.findByText(/dueDate must be a real date/)).toBeInTheDocument();
++  });
++});
