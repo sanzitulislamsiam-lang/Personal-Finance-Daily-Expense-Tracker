@@ -13,6 +13,8 @@ app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use('/api/auth', require('./routes/authRoutes'));
 app.use('/api/users', require('./routes/userRoutes'));
 app.use('/api/accounts', require('./routes/accountRoutes'));
+app.use('/api/transactions', require('./routes/transactionRoutes'));
+app.use('/api/categories', require('./routes/categoryRoutes'));
 
 // Health check endpoint
 app.get('/', (req, res) => {

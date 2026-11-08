@@ -15,8 +15,10 @@ const {
   deleteIncome,
 } = require('../controllers/transactionController');
 const { protect } = require('../middleware/authMiddleware');
+const { requirePinUnlock } = require('../middleware/pinMiddleware');
 
 router.use(protect);
+router.use(requirePinUnlock('transactions')); // R3 PIN lock (only blocks if user locked "transactions")
 
 // ==========================================
 // FEATURE R4: EXPENSE LOGGING ROUTES
